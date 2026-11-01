@@ -519,7 +519,7 @@ uses Assemblerunit, DriverList, LuaHandler, lualib, lua, lauxlib,
   ProcessHandlerUnit, Globals, Parsers, MemoryQuery, LuaCaller,
   UnexpectedExceptionsHelper, frmSymbolEventTakingLongUnit, MainUnit, addresslist,
   MemoryRecordUnit, mainunit2, BetterDLLSearchPath, DebuggerInterfaceAPIWrapper,
-  GDBServerDebuggerInterface;
+  GDBServerDebuggerInterface{$ifdef windows}, turinghvport{$endif};
 {$endif}
 
 
@@ -792,7 +792,10 @@ end;
 
 procedure TSymbolloaderthread.LoadDLLSymbols(loadPDB: boolean; loadmodule: boolean);
 {$IFDEF windows}
-var need:dword;
+var
+    EnumProcessModulesEx: TEnumProcessModulesEx;  //Turing-HV: a hypervisor target's modules do not come from psapi
+    GetModuleFileNameEx: TGetModuleFilenameEx;
+    need:dword;
     x: PPointerArray;
     i: integer;
     count: integer;
@@ -807,6 +810,14 @@ var need:dword;
 begin
   {$ifdef windows}
   need:=0;
+
+  EnumProcessModulesEx:=symbolhandler.EnumProcessModulesEx;
+  GetModuleFileNameEx:=symbolhandler.GetModuleFileNameEx;
+  if TuringHV_IsHVHandle(thisprocesshandle) then
+  begin
+    EnumProcessModulesEx:=@TuringHV_EnumProcessModulesEx;
+    GetModuleFileNameEx:=@TuringHV_GetModuleFileNameExA;
+  end;
 
   modulelisttype:=LIST_MODULES_ALL;
 

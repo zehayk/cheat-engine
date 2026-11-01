@@ -1124,7 +1124,7 @@ uses cefuncproc, MainUnit2, ProcessWindowUnit, MemoryBrowserFormUnit, TypePopup,
   multilineinputqueryunit {$ifdef windows},winsapi{$endif} ,LuaClass, Filehandler{$ifdef windows}, feces{$endif}
   {$ifdef windows},frmDBVMWatchConfigUnit, frmDotNetObjectListUnit{$endif} ,ceregistry ,UnexpectedExceptionsHelper
   ,frmFoundlistPreferencesUnit, fontSaveLoadRegistry{$ifdef windows}, cheatecoins{$endif},strutils, iptlogdisplay,
-  libcepack, symbolsync;
+  libcepack, symbolsync{$ifdef windows}, turinghvui{$endif};
 
 resourcestring
   rsInvalidStartAddress = 'Invalid start address: %s';
@@ -6434,6 +6434,10 @@ begin
   cbPresentMemoryOnly.Visible:=false;
   sbClearActiveMemory.visible:=false;
 
+  {$endif}
+
+  {$ifdef windows}
+  InstallTuringHVUI(self); //Turing-HV menu, options and status window (turinghvui.pas)
   {$endif}
 end;
 

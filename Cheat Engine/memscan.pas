@@ -837,7 +837,7 @@ implementation
 uses ProcessHandlerUnit, parsers, Globals;
 {$else}
 uses formsettingsunit, StrUtils, foundlisthelper, ProcessHandlerUnit, parsers,
-     Globals, frmBusyUnit, controls, mainunit2, processlist;
+     Globals, frmBusyUnit, controls, mainunit2, processlist{$ifdef windows}, turinghvport{$endif};
 {$endif}
 
 resourcestring
@@ -7096,7 +7096,7 @@ begin
 
 
   {$ifdef windows}
-  if workingsetonly and assigned(QueryWorkingSet) then
+  if workingsetonly and assigned(QueryWorkingSet) and not TuringHV_IsHVHandle(processhandle) then  //Turing-HV: every page it reports is present
   begin
     getmemtimestart:=GetTickCount64;
     vqevalidcache:=TAvgLvlTree.Create(@vqevalidcachecompare);

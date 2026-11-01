@@ -121,7 +121,7 @@ implementation
 
 uses KernelDebugger,mainunit, DebugHelper, CustomTypeHandler, ProcessList, Globals,
      frmEditHistoryUnit, DBK32functions, frameHotkeyConfigUnit, UnexpectedExceptionsHelper,
-     TypInfo, StdCtrls, symbolsync;
+     TypInfo, StdCtrls, symbolsync{$ifdef windows}, turinghvport, ceregistry{$endif};
 
 procedure UpdateToolsMenu;
 var i: integer;
@@ -1056,6 +1056,14 @@ begin
 
           {$ifdef windows}
 
+          {Turing-HV: when the hypervisor backend starts with Cheat Engine it replaces the kernel driver's
+           read/write/open/query; loading the driver as well would only ask for a driver this build may not have}
+          if (skipkernelapply=false) and (TuringHV_Active or cereg.readBool('TuringHV.EnableAtStartup', false)) then
+          begin
+            if cbKernelQueryMemoryRegion.checked or cbKernelReadWriteProcessMemory.checked or cbKernelOpenProcess.Checked then
+              TuringHV_Log('the kernel-mode (DBK) settings are not applied: the Turing-HV backend provides open/read/write/query');
+          end
+          else
           if skipkernelapply=false then
           begin
             if cbKernelQueryMemoryRegion.checked then UseDBKQueryMemoryRegion else DontUseDBKQueryMemoryRegion;

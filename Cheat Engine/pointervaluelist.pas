@@ -174,7 +174,7 @@ var
 
 implementation
 
-uses ProcessHandlerUnit, globals, DBK32functions;
+uses ProcessHandlerUnit, globals, DBK32functions{$ifdef windows}, turinghvport{$endif};
 
 resourcestring
   rsPointerValueSetupError = 'Pointer value setup error';
@@ -1171,7 +1171,7 @@ begin
     address:=start;
 
     {$ifdef windows}
-    if scanpagedmemoryonly and assigned(QueryWorkingSet) then
+    if scanpagedmemoryonly and assigned(QueryWorkingSet) and not TuringHV_IsHVHandle(processhandle) then  //Turing-HV: every page it reports is present
     begin
       vqevalidcache:=TAvgLvlTree.Create(@vqecachecompare);
 

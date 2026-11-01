@@ -165,6 +165,8 @@ type
 
     dbvmwatch_unlock: qword;
 
+    onStopWatch: TNotifyEvent; //Turing-HV: stops a hypervisor write watch feeding this dialog (turinghvwatch.pas)
+
 
     addRecord_Address: ptruint;
     iptlog: pointer; //do not free this.  owned by the debugthreadhandler
@@ -609,7 +611,15 @@ begin
 end;
 
 procedure TFoundCodeDialog.stopdbvmwatch;
+var stopper: TNotifyEvent;
 begin
+  if assigned(onStopWatch) then
+  begin
+    stopper:=onStopWatch;
+    onStopWatch:=nil;
+    stopper(self);
+  end;
+
   {$IFDEF windows}
   if dbvmwatchpollthread<>nil then
   begin

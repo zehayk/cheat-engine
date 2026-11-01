@@ -134,7 +134,8 @@ uses autoassembler, MainUnit, MainUnit2, LuaClass, frmluaengineunit, plugin, plu
   rttihelper, LuaDotNetPipe, LuaRemoteExecutor, windows7taskbar, debugeventhandler,
   tcclib, dotnethost, CSharpCompiler, LuaCECustomButton, feces, process,
   networkInterface, networkInterfaceApi, LuaVirtualStringTree, userbytedisassembler,
-  parsers, LuaNetworkInterface, symbolsync, GDBServerDebuggerInterface, contexthandler;
+  parsers, LuaNetworkInterface, symbolsync, GDBServerDebuggerInterface, contexthandler
+  {$ifdef windows}, turinghvport, turinghvlua{$endif};
 
   {$warn 5044 off}
 
@@ -14122,6 +14123,9 @@ begin
 
 
  {$IFDEF windows}
+ if TuringHV_IsHVHandle(processhandle) then
+    peb:=TuringHV_GetPEB(processhandle)  //Turing-HV: found through the hypervisor (or the query-only handle)
+ else
  if DBKLoaded then
     peb:=dbk_getPEB(GetPEProcess(processid))
   else
@@ -16386,6 +16390,10 @@ begin
 
 
   initializeLuaNetworkInterface(L);
+
+  {$ifdef windows}
+  initializeLuaTuringHV(L); //turinghv_* functions (turinghvlua.pas)
+  {$endif}
 
 {$ifdef darwin}
   lua_register(L, 'createMachThread', lua_createMachThread);
