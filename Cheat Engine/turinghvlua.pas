@@ -11,7 +11,7 @@ unit turinghvlua;
                                                                     EPROCESS.DirectoryTableBase, to test the rest)
     turinghv_showStatus()                    opens the status / log window
     turinghv_getOption(name), turinghv_setOption(name, bool)
-                                             'OSHandle', 'OSFallback', 'SharedCodeWrites', 'SlowCR3'
+                                             'OSHandle', 'OSFallback', 'SharedCodeWrites', 'SlowCR3', 'WatchHarder'
     turinghv_readMemoryCR3(cr3, address, size)        -> bytetable, or nil
     turinghv_writeMemoryCR3(cr3, address, bytetable)  -> boolean
     turinghv_readPhysical(address, size)     -> bytetable, or nil, error   (needs the physical capability)
@@ -19,7 +19,13 @@ unit turinghvlua;
     turinghv_getKernelModules()              -> { {name, base, size, entry}, ... }
     turinghv_slatQuery(address, pages)       -> { {va, pa, flags}, ... }, slat   (target's address space)
     turinghv_readLog(from)                   -> text, next     (the hypervisor's text log)
-    turinghv_findWhatWrites(address, size)   opens the sampled write-watch dialog
+    turinghv_findWhatWrites(address, size)   opens the write-watch dialog (debug registers; sampled on old images)
+    turinghv_findWhatAccesses(address, size) opens the access-watch dialog (debug registers: reads or writes)
+    turinghv_findWhatAddressesInstructionAccesses(address) -> ok, why   opens the instruction watch's dialog
+    turinghv_captureHere(address) -> ok, why   arms a capture breakpoint: snapshot every value at the instruction, then disarm
+    turinghv_setBreakpoint(address) -> ok, why  arms a parking breakpoint: a thread stops here; step / continue it in the window
+                                             (rev147: "find out what addresses this instruction accesses")
+    turinghv_bridgeStats([reset])            the bridge's requests per command, and their microseconds
     turinghv_getLog()                        -> Cheat Engine's Turing-HV log
 *)
 
@@ -50,6 +56,7 @@ type
     a: ptruint;
     b: integer;
     ok: boolean;
+    why: string;
     procedure run;
   end;
 
@@ -59,6 +66,10 @@ begin
     1: ok:=TuringHV_EnableFromUI(false);
     2: TuringHV_DisableFromUI;
     3: TuringHV_FindWhatWrites(a, b);
+    5: TuringHV_FindWhatAccesses(a, b);
+    6: ok:=TuringHV_StartInstructionWatch(a, why);
+    7: ok:=TuringHV_StartCapture(a, why);
+    8: ok:=TuringHV_SetBreakpoint(a, why);
     4: TuringHV_ShowStatus;
   end;
 end;
@@ -358,9 +369,84 @@ begin
   result:=0;
 end;
 
+function l_findWhatAccesses(L: Plua_State): integer; cdecl;
+begin
+  onMainThread(5, lua_tointeger(L,1), max(1, lua_tointeger(L,2)));
+  result:=0;
+end;
+
+function l_findWhatAddressesInstructionAccesses(L: Plua_State): integer; cdecl;
+var c: TMainThreadCall;
+begin
+  c:=TMainThreadCall.Create;
+  try
+    c.op:=6;
+    c.a:=ptruint(lua_tointeger(L,1));
+    if GetCurrentThreadId=MainThreadID then c.run else TThread.Synchronize(nil, c.run);
+    lua_pushboolean(L, c.ok);
+    lua_pushstring(L, pchar(c.why));
+  finally
+    c.free;
+  end;
+  result:=2;
+end;
+
+function l_captureHere(L: Plua_State): integer; cdecl;
+var c: TMainThreadCall;
+begin
+  c:=TMainThreadCall.Create;
+  try
+    c.op:=7;
+    c.a:=ptruint(lua_tointeger(L,1));
+    if GetCurrentThreadId=MainThreadID then c.run else TThread.Synchronize(nil, c.run);
+    lua_pushboolean(L, c.ok);
+    lua_pushstring(L, pchar(c.why));
+  finally
+    c.free;
+  end;
+  result:=2;
+end;
+
+function l_setBreakpoint(L: Plua_State): integer; cdecl;
+var c: TMainThreadCall;
+begin
+  c:=TMainThreadCall.Create;
+  try
+    c.op:=8;
+    c.a:=ptruint(lua_tointeger(L,1));
+    if GetCurrentThreadId=MainThreadID then c.run else TThread.Synchronize(nil, c.run);
+    lua_pushboolean(L, c.ok);
+    lua_pushstring(L, pchar(c.why));
+  finally
+    c.free;
+  end;
+  result:=2;
+end;
+
 function l_getLog(L: Plua_State): integer; cdecl;
 begin
   lua_pushstring(L, pchar(TuringHV_LogText));
+  result:=1;
+end;
+
+// turinghv_bridgeStats([reset]) -> a table of (name, count, us) for every command asked since the last reset
+function l_bridgeStats(L: Plua_State): integer; cdecl;
+var k, n: integer;
+begin
+  lua_newtable(L);
+  n:=0;
+  for k:=0 to THVB_STAT_CMDS-1 do
+    if thvStatCount[k]<>0 then
+    begin
+      inc(n);
+      lua_pushinteger(L, n);
+      lua_newtable(L);
+      setfield_s(L, 'name', pchar(thvCmdName(k)));
+      setfield_i(L, 'count', thvStatCount[k]);
+      setfield_i(L, 'us', thvStatMicros[k]);
+      lua_settable(L, -3);
+    end;
+  if (lua_gettop(L)>=2) and lua_toboolean(L, 1) then thvStatsReset;
   result:=1;
 end;
 
@@ -376,6 +462,7 @@ begin
   if sametext(name,'OSFallback') then exit(@thvOptOSFallback);
   if sametext(name,'SharedCodeWrites') then exit(@thvOptSharedCodeWrites);
   if sametext(name,'SlowCR3') then exit(@thvOptSlowCr3);
+  if sametext(name,'WatchHarder') then exit(@thvOptWatchHarder);
   result:=nil;
 end;
 
@@ -414,7 +501,12 @@ begin
   lua_register(L, 'turinghv_slatQuery', l_slatQuery);
   lua_register(L, 'turinghv_readLog', l_readLog);
   lua_register(L, 'turinghv_findWhatWrites', l_findWhatWrites);
+  lua_register(L, 'turinghv_findWhatAccesses', l_findWhatAccesses);
+  lua_register(L, 'turinghv_findWhatAddressesInstructionAccesses', l_findWhatAddressesInstructionAccesses);
+  lua_register(L, 'turinghv_captureHere', l_captureHere);
+  lua_register(L, 'turinghv_setBreakpoint', l_setBreakpoint);
   lua_register(L, 'turinghv_getLog', l_getLog);
+  lua_register(L, 'turinghv_bridgeStats', l_bridgeStats);
 end;
 
 {$endif}

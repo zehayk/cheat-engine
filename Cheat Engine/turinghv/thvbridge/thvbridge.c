@@ -31,6 +31,8 @@ _Static_assert(offsetof(thvb_shared, rsp_event) == 560, "layout");
 _Static_assert(offsetof(thvb_shared, conn) == 1072, "layout");
 _Static_assert(offsetof(thvb_shared, access) == 1088, "layout");
 _Static_assert(sizeof(thv_access) == 288, "layout");
+_Static_assert(sizeof(thv_dwatch_status) == 80 && sizeof(thv_dwatch_entry) == 264, "layout (turinghvbridge.pas)");
+_Static_assert(sizeof(thv_dwatch_operand) == 32, "layout (turinghvbridge.pas TThvDWatchOperand)");
 _Static_assert(offsetof(thvb_shared, version) == 1376, "layout");
 _Static_assert(sizeof(thvb_shared) <= THVB_PAGE, "header page");
 _Static_assert(offsetof(thvb_slot, arg) == 24, "layout");
@@ -368,6 +370,117 @@ static void dispatch(worker *w, const thvb_slot *q, thvb_slot *r, uint8_t *d, in
         r->status = thv_wwatch_clear((thv_xwatch_status *)d);
         r->out_len = sizeof(thv_xwatch_status);
         break;
+
+    /* turing-hv rev146b: the data watch (the hypervisor's nested page tables). The address space named must be someone
+     * else's (never 0 = ours, never the bridge's own); nothing of the target is written by arming it. */
+    case THVB_CMD_DWATCH_ARM: {
+        if (!foreign_cr3(q->arg[0]) || !q->arg[2] || q->arg[2] > THV_DWATCH_LEN_MAX) { r->status = THV_E_BAD_ARGUMENT; break; }
+        uint32_t id = 0;
+        memset(d, 0, sizeof(thv_dwatch_status));
+        r->status = thv_dwatch_arm(q->arg[0], q->arg[1], (uint32_t)q->arg[2], (uint32_t)q->arg[3], &id,
+                                   (thv_dwatch_status *)d);
+        r->ret[0] = id;
+        r->out_len = sizeof(thv_dwatch_status);
+        break;
+    }
+    case THVB_CMD_DWATCH_READ: {
+        const uint32_t n = min_u32(q->arg[2], (cap - THVB_ARRAY_OFF) / sizeof(thv_dwatch_entry));
+        thv_dwatch_status *s = (thv_dwatch_status *)d;
+        memset(s, 0, sizeof *s);
+        thv_dwatch_entry *e = (thv_dwatch_entry *)(d + THVB_ARRAY_OFF);
+        r->status = thv_dwatch_read((uint32_t)q->arg[0], (uint32_t)q->arg[1], e, n, s);
+        const uint32_t got = s->count > n ? n : s->count;
+        r->ret[0] = got;
+        r->out_len = THVB_ARRAY_OFF + got * (uint32_t)sizeof(thv_dwatch_entry);
+        break;
+    }
+    case THVB_CMD_DWATCH_CLEAR:
+        memset(d, 0, sizeof(thv_dwatch_status));
+        r->status = thv_dwatch_clear((uint32_t)q->arg[0], (thv_dwatch_status *)d);
+        r->out_len = sizeof(thv_dwatch_status);
+        break;
+    /* turing-hv rev147: the instruction watch -- the same rules as the data watch's arming */
+    case THVB_CMD_DWATCH_ARM_EXEC: {
+        if (!foreign_cr3(q->arg[0]) || !q->arg[2] || q->arg[2] > 15u || q->in_len < sizeof(thv_dwatch_operand) ||
+            (q->arg[3] & ~(uint64_t)THV_DWATCH_HARD)) {
+            r->status = THV_E_BAD_ARGUMENT;
+            break;
+        }
+        thv_dwatch_operand op;
+        memcpy(&op, d, sizeof op);
+        uint32_t id = 0;
+        memset(d, 0, sizeof(thv_dwatch_status));
+        r->status = thv_dwatch_arm_exec2(q->arg[0], q->arg[1], (uint32_t)q->arg[2], &op, (uint32_t)q->arg[3], &id,
+                                         (thv_dwatch_status *)d);
+        r->ret[0] = id;
+        r->out_len = sizeof(thv_dwatch_status);
+        break;
+    }
+    /* turing-hv rev148: the capture breakpoint -- operand @0, config @THVB_ARRAY_OFF; the same arming rules */
+    case THVB_CMD_DWATCH_ARM_CAPTURE: {
+        if (!foreign_cr3(q->arg[0]) || !q->arg[2] || q->arg[2] > 15u ||
+            q->in_len < THVB_ARRAY_OFF + sizeof(thv_capture_cfg)) {
+            r->status = THV_E_BAD_ARGUMENT;
+            break;
+        }
+        thv_dwatch_operand op;
+        thv_capture_cfg cfg;
+        memcpy(&op, d, sizeof op);
+        memcpy(&cfg, d + THVB_ARRAY_OFF, sizeof cfg);
+        uint32_t id = 0;
+        memset(d, 0, sizeof(thv_dwatch_status));
+        r->status = thv_dwatch_arm_capture(q->arg[0], q->arg[1], (uint32_t)q->arg[2], &op, &cfg, &id,
+                                           (thv_dwatch_status *)d);
+        r->ret[0] = id;
+        r->out_len = sizeof(thv_dwatch_status);
+        break;
+    }
+    case THVB_CMD_DWATCH_CAP_READ: {
+        if (THVB_ARRAY_OFF + sizeof(thv_capture_rec) > cap) { r->status = THV_E_BAD_ARGUMENT; break; }
+        thv_dwatch_status *s = (thv_dwatch_status *)d;
+        memset(s, 0, sizeof *s);
+        thv_capture_rec *rec = (thv_capture_rec *)(d + THVB_ARRAY_OFF);
+        memset(rec, 0, sizeof *rec);
+        r->status = thv_dwatch_cap_read((uint32_t)q->arg[0], (uint32_t)q->arg[1], rec, s);
+        r->ret[0] = s->count;
+        r->out_len = THVB_ARRAY_OFF + (uint32_t)sizeof(thv_capture_rec);
+        break;
+    }
+    /* turing-hv rev149: the parking breakpoint */
+    case THVB_CMD_DWATCH_ARM_BREAK: {
+        if (!foreign_cr3(q->arg[0]) || !q->arg[2] || q->arg[2] > 15u || q->in_len < sizeof(thv_dwatch_operand)) {
+            r->status = THV_E_BAD_ARGUMENT;
+            break;
+        }
+        thv_dwatch_operand op;
+        memcpy(&op, d, sizeof op);
+        uint32_t id = 0;
+        memset(d, 0, sizeof(thv_dwatch_status));
+        r->status = thv_dwatch_arm_break(q->arg[0], q->arg[1], (uint32_t)q->arg[2], &op, &id, (thv_dwatch_status *)d);
+        r->ret[0] = id;
+        r->out_len = sizeof(thv_dwatch_status);
+        break;
+    }
+    case THVB_CMD_DWATCH_BK_READ: {
+        if (THVB_ARRAY_OFF + sizeof(thv_capture_rec) > cap) { r->status = THV_E_BAD_ARGUMENT; break; }
+        thv_dwatch_status *s = (thv_dwatch_status *)d;
+        memset(s, 0, sizeof *s);
+        thv_capture_rec *rec = (thv_capture_rec *)(d + THVB_ARRAY_OFF);
+        memset(rec, 0, sizeof *rec);
+        r->status = thv_dwatch_break_read((uint32_t)q->arg[0], (uint32_t)q->arg[1], rec, s);
+        r->ret[0] = s->count;
+        r->out_len = THVB_ARRAY_OFF + (uint32_t)sizeof(thv_capture_rec);
+        break;
+    }
+    case THVB_CMD_DWATCH_BK_CMD: {
+        if (q->in_len < sizeof(thv_break_cmd)) { r->status = THV_E_BAD_ARGUMENT; break; }
+        thv_break_cmd bc;
+        memcpy(&bc, d, sizeof bc);
+        memset(d, 0, sizeof(thv_dwatch_status));
+        r->status = thv_dwatch_break_cmd((uint32_t)q->arg[0], &bc, (thv_dwatch_status *)d);
+        r->out_len = sizeof(thv_dwatch_status);
+        break;
+    }
 
     case THVB_CMD_SLAT_QUERY: {
         uint32_t n = min_u32(q->arg[2], cap / sizeof(thv_slat_page));

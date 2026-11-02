@@ -30,11 +30,14 @@
 extern "C" {
 #endif
 
-#define THV_CLIENT_API_VERSION 0x00010007u   /* 1.1: batched transfers; 1.2: physical reads; 1.3: the caller gate;
+#define THV_CLIENT_API_VERSION 0x0001000Au   /* 1.1: batched transfers; 1.2: physical reads; 1.3: the caller gate;
                                                 1.4: the operator's trusted programs; 1.5: trusted at once, a
                                                 connection without a session, the boot recorder's hook sites;
                                                 1.6: the write watch, enriched watch hits, recording now;
-                                                1.7: the hypervisor's text log */
+                                                1.7: the hypervisor's text log;
+                                                1.8: the data watch (thv_dwatch_*);
+                                                1.9: the instruction watch (thv_dwatch_arm_exec);
+                                                1.10: "watch harder" (thv_dwatch_arm_exec2) */
 #define THV_CR3_SCAN_VALIDATORS 4u
 
 /* Hypervisor statuses retain their firmware values.  Client-side failures use
@@ -459,6 +462,87 @@ THV_API uint32_t THV_CALL thv_wwatch_arm(uint64_t cr3, uint64_t address, uint64_
                                          uint64_t *pages, uint32_t cap, thv_xwatch_status *status);
 THV_API uint32_t THV_CALL thv_wwatch_read(uint32_t from, thv_watch_hit *hits, uint32_t max, thv_xwatch_status *status);
 THV_API uint32_t THV_CALL thv_wwatch_clear(thv_xwatch_status *status);
+
+/*
+ * 1.8 (rev146b): THE DATA WATCH -- "find out what writes / what accesses this address", on the hypervisor's nested
+ * page tables: the watched page is kept read-only (a write watch) or out of reach (an access watch), so every write /
+ * access of it exits to the hypervisor, which records the ones that touched the watched bytes and lets each through
+ * (that one instruction single-stepped on its own vCPU). Nothing is shown to Windows or the target. EXACT: every
+ * access, counted per instruction by the hypervisor with the instruction's registers and stack top at its first hit;
+ * an entry's rip is the accessing instruction itself. Up to 4 watches, 1..4096 bytes each (at most two pages). Every
+ * access to the PAGE costs two exits, the watched bytes or not (status.elsewhere counts the misses): a watch may cost
+ * 20,000 a second, judged per tenth of a second -- over a tenth's share it pauses for the rest of that tenth
+ * (status.throttled counts the pauses; reading the watch after one turns it on again, so read it ~10 times a second). A watch nobody reads for 10 s
+ * stops on its own. A session with READ is enough. Nested images only (THV_E_UNSUPPORTED otherwise); a hypervisor
+ * older than this answers THV_E_BAD_ARGUMENT.
+ */
+#define THV_DWATCH_WRITE   1u         /* writes                                      */
+#define THV_DWATCH_ACCESS  3u         /* reads or writes                             */
+#define THV_DWATCH_MAX     4u
+#define THV_DWATCH_LEN_MAX 4096u
+#define THV_DWATCH_E_READ  1u         /* thv_dwatch_entry.flags                      */
+#define THV_DWATCH_E_WRITE 2u
+typedef struct thv_dwatch_status {
+    uint32_t supported, id;
+    uint32_t active;          /* bit n-1 = watch n armed                                           */
+    uint32_t pages;           /* this watch's pages armed now                                      */
+    uint64_t hits, other, elsewhere, dropped, unstepped;
+    uint32_t entries, count;  /* instructions recorded; entries in this answer                      */
+    uint32_t throttled, paused;
+    uint64_t tsc_hz;
+} thv_dwatch_status;
+typedef struct thv_dwatch_entry {
+    uint64_t rip, count, cr3, rflags, rsp, addr;
+    uint64_t gpr[16];         /* RAX RCX RDX RBX RSP RBP RSI RDI R8..R15, at the first hit, before it ran */
+    uint64_t stack[8];
+    uint64_t tsc;
+    uint32_t vcpu, cpl, nstack, flags;
+} thv_dwatch_entry;
+/* `kind` THV_DWATCH_WRITE or THV_DWATCH_ACCESS; *id (1..4) names the watch. THV_E_BAD_POINTER: no page of the range is
+ * mapped now; THV_E_NO_SPACE: four watches already. */
+THV_API uint32_t THV_CALL thv_dwatch_arm(uint64_t cr3, uint64_t address, uint32_t length, uint32_t kind, uint32_t *id,
+                                         thv_dwatch_status *status);
+/* Entries from `first`, up to `max`; status->count of them, status->entries in all. Keeps the watch alive. */
+THV_API uint32_t THV_CALL thv_dwatch_read(uint32_t id, uint32_t first, thv_dwatch_entry *entries, uint32_t max,
+                                          thv_dwatch_status *status);
+/* One watch, or every one (id 0). */
+THV_API uint32_t THV_CALL thv_dwatch_clear(uint32_t id, thv_dwatch_status *status);
+
+/*
+ * 1.9 (rev147): THE INSTRUCTION WATCH -- "find out what addresses this instruction accesses". The instruction's code
+ * page is composed NOT executable; the first instruction run from it exits to the hypervisor, and from there every
+ * instruction on that page is single-stepped (a chain, on that vCPU, the guest seeing nothing) until execution leaves
+ * the page. Each time the watched instruction is about to run, the address its memory operand names is worked out from
+ * the registers as they are then -- the hypervisor only adds what the caller's disassembler describes:
+ *     address = disp + reg[0] * scale[0] + reg[1] * scale[1]  (+ the FS / GS base; 32-bit code: the low 32 bits)
+ * Read with thv_dwatch_read / cleared with thv_dwatch_clear like a data watch; an entry is one ADDRESS (entry.addr):
+ * rip = the instruction, count = its runs that used that address, the registers those of the first, flags
+ * THV_DWATCH_E_EXEC. A kernel-half instruction is watched in every address space, a user-half one in `cr3`'s (status
+ * .other counts the rest). Costs one exit per instruction run on the page (status.elsewhere: those that were not the
+ * watched one), within 20,000 a second as above -- 100,000 armed with THV_DWATCH_HARD (thv_dwatch_arm_exec2: "watch
+ * harder", the game visibly slower while it runs). On hot code the counts are a sample. A hypervisor older than this
+ * answers THV_E_BAD_ARGUMENT.
+ */
+#define THV_DWATCH_EXEC    4u         /* kind (thv_dwatch_arm_exec)                  */
+#define THV_DWATCH_E_EXEC  4u         /* thv_dwatch_entry.flags                      */
+#define THV_DWATCH_SEG_FS  4u         /* thv_dwatch_operand.seg                      */
+#define THV_DWATCH_SEG_GS  5u
+#define THV_DWATCH_HARD    1u         /* thv_dwatch_arm_exec2 flags: "watch harder" (1.10) */
+typedef struct thv_dwatch_operand {
+    int64_t  disp;
+    int64_t  scale[2];        /* 0 = no term                                                        */
+    uint8_t  reg[2];          /* 0..15: RAX RCX RDX RBX RSP RBP RSI RDI R8..R15                      */
+    uint8_t  seg;             /* 0, THV_DWATCH_SEG_FS or THV_DWATCH_SEG_GS                           */
+    uint8_t  rsvd[5];         /* 0                                                                  */
+} thv_dwatch_operand;
+/* `address` = the instruction, `length` its length (1..15). */
+THV_API uint32_t THV_CALL thv_dwatch_arm_exec(uint64_t cr3, uint64_t address, uint32_t length,
+                                              const thv_dwatch_operand *operand, uint32_t *id, thv_dwatch_status *status);
+/* 1.10: the same with `flags` (THV_DWATCH_HARD or 0). A hypervisor older than rev147b answers THV_E_BAD_ARGUMENT for
+ * THV_DWATCH_HARD. */
+THV_API uint32_t THV_CALL thv_dwatch_arm_exec2(uint64_t cr3, uint64_t address, uint32_t length,
+                                               const thv_dwatch_operand *operand, uint32_t flags, uint32_t *id,
+                                               thv_dwatch_status *status);
 
 /*
  * 1.4 (rev137): THE BOOT RECORDER. Asked for once (THV_BOOTMON_ARM, 30..600 seconds), the NEXT boot looks at

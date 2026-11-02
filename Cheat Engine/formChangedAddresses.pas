@@ -182,6 +182,7 @@ type
     foundcodedialog: pointer;
 
     dbvmwatch_unlock: qword;
+    onStopWatch: TNotifyEvent; //Turing-HV: stops the hypervisor instruction watch feeding this dialog (turinghvwatch.pas)
 
     breakpoint: pointer;
 
@@ -523,7 +524,8 @@ begin
       debuggerthread.FindWhatCodeAccessesStop(self);
   end;
 
-  debuggerthread.guiupdate:=true;
+  if debuggerthread<>nil then //Turing-HV: an instruction watch feeds this dialog with no debugger running
+    debuggerthread.guiupdate:=true;
 end;
 
 
@@ -1493,7 +1495,15 @@ begin
 end;
 
 procedure TfrmChangedAddresses.stopdbvmwatch;
+var stopper: TNotifyEvent;
 begin
+  if assigned(onStopWatch) then
+  begin
+    stopper:=onStopWatch;
+    onStopWatch:=nil;
+    stopper(self);
+  end;
+
   {$IFDEF windows}
   if dbvmwatchpollthread<>nil then
   begin

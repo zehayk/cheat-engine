@@ -54,6 +54,7 @@ type
     fRegions: TThvRegions;
     fRegionsTime: qword;
     fRegionsValid: boolean;
+    fRegionsCost: qword;   //ms the last full memory map took (it sets how long the map stays fresh)
     fModules: TThvModEntries;
     fModulesTime: qword;
     fModulesValid: boolean;
@@ -85,7 +86,7 @@ type
     function Regions(maxage: dword=750): TThvRegions;
     procedure Invalidate;
     function FullOSHandle: THandle;
-    function ModuleAt(address: qword; out m: TThvModEntry): boolean;
+    function ModuleAt(address: qword; out m: TThvModEntry; maxage: dword=3000): boolean;
     { Is the process still the one we opened?  Its page-table root is only meaningful while it lives: after it
       exits Windows frees that page, and a write through a reused root would land in someone else's memory. }
     function Alive(maxage: dword; forWrite: boolean): boolean;
@@ -96,6 +97,17 @@ var
   thvOptOSFallback: boolean=false;       //alloc/free/protect/remote thread through Windows when it allows
   thvOptSharedCodeWrites: boolean=false; //allow writes into read-only image pages of Windows' own DLLs
   thvOptSlowCr3: boolean=true;           //try the CR3-write watch and the physical sweep when EPROCESS lies
+  thvOptWatchHarder: boolean=false;      //rev147b: the instruction watch at 100,000 steps a second (the game stutters)
+  //rev148: the capture breakpoint's snapshot -- how much to save at the hit (turinghvwatch.pas; persisted by turinghvui.pas)
+  thvCapStackBytes: dword=256;           //bytes of stack from RSP (0..512)
+  thvCapCodeBefore: dword=32;            //code bytes before RIP (before + after <= 256)
+  thvCapCodeAfter: dword=32;             //code bytes from RIP on
+  thvCapDerefBytes: dword=64;            //bytes at each register / the operand (0..128)
+  thvCapFollowRegs: boolean=true;        //read memory at every register that looks like a pointer
+  thvCapOperand: boolean=true;           //read memory at the instruction's operand
+  thvCapSSE: boolean=true;               //capture XMM0..15 and the FPU control words
+  thvCapIdent: boolean=true;             //read the thread's PID / TID from the TEB
+  thvCapMaxHits: dword=1;                //captures before the breakpoint disarms (1..4 kept)
 
 function TuringHV_Enable(out msg: string): boolean;
 procedure TuringHV_Disable;
@@ -799,12 +811,12 @@ begin
   cs.Leave;
 end;
 
-function TThvTarget.ModuleAt(address: qword; out m: TThvModEntry): boolean;
+function TThvTarget.ModuleAt(address: qword; out m: TThvModEntry; maxage: dword): boolean;
 var
   l: TThvModEntries;
   i: integer;
 begin
-  l:=Modules;
+  l:=Modules(maxage);
   for i:=0 to length(l)-1 do
     if (address>=l[i].base) and (address<l[i].base+l[i].size) then
     begin
@@ -838,6 +850,7 @@ var
   st: dword;
   m: TThvModEntry;
   found: boolean;
+  t0: qword;
 
   procedure emit(rb, re: qword; p: dword);
   var mi: integer;
@@ -860,6 +873,7 @@ var
   end;
 
 begin
+  t0:=GetTickCount64;
   st:=bridge.EnumMemory(cr3, 0, USER_LIMIT, 0, raw);
   if st<>THV_OK then
     TuringHV_Log(format('pid %d: memory map: %s',[pid, thvStatusString(st)]));
@@ -912,15 +926,25 @@ begin
   cs.Enter;
   fRegions:=out_;
   fRegionsTime:=GetTickCount64;
+  fRegionsCost:=fRegionsTime-t0;
   fRegionsValid:=true;
   cs.Leave;
+  if fRegionsCost>=200 then
+    TuringHV_Log(format('pid %d: the memory map took %d ms (%d regions): outside a scan it is now rebuilt at most every %d s',
+      [pid, fRegionsCost, n, (fRegionsCost*20) div 1000]));
 end;
 
 function TThvTarget.Regions(maxage: dword): TThvRegions;
 var fresh: boolean;
+  ttl: qword;
 begin
   cs.Enter;
-  fresh:=fRegionsValid and ((cacheDepth>0) or (GetTickCount64-fRegionsTime<maxage));
+  {maxage 0 = rebuild now (a scan starting).  Otherwise the map stays fresh at least 20 times as long as it took to
+   build: a map that costs the hypervisor seconds (a big game on an image before rev146) must not be rebuilt every
+   750 ms by whatever asks VirtualQueryEx -- the memory view, a frozen value -- stalling the channel each time}
+  ttl:=maxage;
+  if (maxage<>0) and (fRegionsCost*20>ttl) then ttl:=fRegionsCost*20;
+  fresh:=fRegionsValid and ((cacheDepth>0) or (GetTickCount64-fRegionsTime<ttl));
   if fresh then result:=fRegions;
   cs.Leave;
   if fresh then exit;
@@ -1164,23 +1188,25 @@ begin
   TuringHV_Log(format('pid %d: %s',[t.pid, msg]));
 end;
 
+{ Is this a read-only page of a Windows DLL's image (shared by every process that maps the file)?  Asked before EVERY
+  write -- a frozen value is written ten times a second -- so it must be cheap: first the module (the cached list, a
+  minute old at most: Windows' DLLs do not come and go), and only inside a Windows DLL that one page's protection.
+  Until 2026-11-01 it asked for the whole memory map (refreshed every 750 ms): a frozen value made the hypervisor walk
+  a big game's page tables over and over, and the machine stuttered. }
 function sharedSystemCode(t: TThvTarget; address: qword): boolean;
 var
-  r: TThvRegions;
-  i: integer;
   m: TThvModEntry;
+  pg: array[0..0] of TThvSlatPage;
+  slat: dword;
+  got: integer;
 begin
   result:=false;
   if thvOptSharedCodeWrites or (address>=USER_LIMIT) then exit;
-  r:=t.Regions;
-  for i:=0 to length(r)-1 do
-    if (address>=r[i].base) and (address<r[i].base+r[i].size) then
-    begin
-      if (r[i].mtype=MEM_IMAGE) and ((r[i].protect=PAGE_READONLY) or (r[i].protect=PAGE_EXECUTE_READ)) and
-         t.ModuleAt(address, m) and (pos(uppercase(windowsDir), uppercase(m.path))=1) then
-        exit(true);
-      exit(false);
-    end;
+  if not t.ModuleAt(address, m, 60000) then exit;
+  if pos(uppercase(windowsDir), uppercase(m.path))<>1 then exit;
+  if (bridge.SlatQuery(t.cr3, address and qword($fffffffffffff000), 1, pg, slat, got)<>THV_OK) or (got<1) then
+    exit(true);                                     //cannot tell: treat it as shared (the write is refused)
+  result:=((pg[0].flags and THV_SLAT_G_PRESENT)<>0) and ((pg[0].flags and THV_SLAT_G_WRITE)=0);
 end;
 
 function HV_WriteProcessMemory(hProcess: THandle; const lpBaseAddress: Pointer; lpBuffer: Pointer; nSize: size_t; var lpNumberOfBytesWritten: PTRUINT): BOOL; stdcall;

@@ -26,6 +26,9 @@ function Import-VsEnv($bat) {
 $vsroot = 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build'
 $t64exe = Join-Path $Work 'thvtarget.exe'
 $t32exe = Join-Path $Work 'thvtarget32.exe'
+$src = Get-Item (Join-Path $here 'thvtarget.c')
+if ((Test-Path $t64exe) -and (Get-Item $t64exe).LastWriteTime -lt $src.LastWriteTime) { Remove-Item $t64exe -Force }
+if ((Test-Path $t32exe) -and (Get-Item $t32exe).LastWriteTime -lt $src.LastWriteTime) { Remove-Item $t32exe -Force }
 if (-not (Test-Path $t64exe)) {
     Import-VsEnv "$vsroot\vcvars64.bat"
     & clang -O1 -D_CRT_SECURE_NO_WARNINGS (Join-Path $here 'thvtarget.c') -o $t64exe

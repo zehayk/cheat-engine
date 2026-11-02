@@ -106,6 +106,67 @@ local function testTarget(label, info, exename, is64)
     end
   end
   check(label .. ': write watch finds the writer', got >= 1, got .. ' instruction(s): ' .. opc:gsub('[\r\n]', ' '))
+
+  -- instruction watch (rev147): the addresses bump's increment accesses -- the counter, and nothing else
+  local ia, itext, a = nil, '', info.bump
+  for k = 1, 8 do
+    local _, _, opcode = splitDisassembledString(disassemble(a))
+    if opcode and opcode:find('[', 1, true) and not opcode:lower():find('sp') then ia = a; itext = opcode; break end
+    a = a + getInstructionSize(a)
+  end
+  check(label .. ': bump has a memory-writing instruction', ia ~= nil, itext)
+  if ia then
+    local ok, why = turinghv_findWhatAddressesInstructionAccesses(ia)
+    check(label .. ': instruction watch armed at ' .. hex(ia) .. ' (' .. itext .. ')', ok, why)
+    if ok then
+      sleepms(2500)
+      local n, hit, txt, others = 0, false, '', 0
+      for i = 0, getFormCount() - 1 do
+        local f = getForm(i)
+        if f.Caption:find('Accessed addresses by', 1, true) and f.Caption:find('Turing-HV', 1, true) then
+          local lv = f.findComponentByName('Changedlist')
+          if lv then
+            n = lv.Items.Count
+            for j = 0, n - 1 do
+              if tonumber(lv.Items[j].Caption, 16) == info.counter then hit = true; txt = lv.Items[j].SubItems.Text
+              else others = others + 1 end
+            end
+          end
+          log('       ' .. f.Caption)
+          f.findComponentByName('OKButton').doClick()   -- Stop
+          f.close()
+        end
+      end
+      check(label .. ': instruction watch names the counter', hit and others == 0,
+            n .. ' address(es), ' .. others .. ' not the counter; ' .. txt:gsub('[\r\n]', ' '))
+    end
+    -- rev147b: "watch harder" -- the same instruction at 100,000 steps a second
+    local was = turinghv_getOption('WatchHarder')
+    turinghv_setOption('WatchHarder', true)
+    local ok2, why2 = turinghv_findWhatAddressesInstructionAccesses(ia)
+    check(label .. ': instruction watch armed harder', ok2, why2)
+    if ok2 then
+      sleepms(2500)
+      local harder, hit2, cap = false, false, ''
+      for i = 0, getFormCount() - 1 do
+        local f = getForm(i)
+        if f.Caption:find('Accessed addresses by', 1, true) and f.Caption:find('Turing-HV', 1, true) then
+          cap = f.Caption
+          harder = f.Caption:find('watching harder', 1, true) ~= nil
+          local lv = f.findComponentByName('Changedlist')
+          if lv then
+            for j = 0, lv.Items.Count - 1 do
+              if tonumber(lv.Items[j].Caption, 16) == info.counter then hit2 = true end
+            end
+          end
+          f.findComponentByName('OKButton').doClick()
+          f.close()
+        end
+      end
+      check(label .. ': watching harder, the counter found', harder and hit2, cap)
+    end
+    turinghv_setOption('WatchHarder', was)
+  end
 end
 
 local timer = createTimer(nil, false)

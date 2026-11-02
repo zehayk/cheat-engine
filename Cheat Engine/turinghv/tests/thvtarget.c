@@ -17,7 +17,8 @@ typedef struct {
 
 static block_t g_static = { "STATICMARKER!!!", 424242, 0, 0, 55.5, 0 };
 
-static void bump(volatile int32_t *p) { (*p)++; }   /* the writing instruction lives here */
+/* the writing instruction lives here -- never inlined, so the loop runs THIS copy (the instruction watch's test) */
+static __attribute__((noinline)) void bump(volatile int32_t *p) { (*p)++; }
 
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : ".";

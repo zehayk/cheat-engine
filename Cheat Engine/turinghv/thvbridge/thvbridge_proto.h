@@ -123,7 +123,25 @@ enum thvb_cmd {
     THVB_CMD_SLAT_QUERY        = 30,    /* arg0 cr3, arg1 address, arg2 pages; out: thv_slat_page[]; ret0 slat      */
     THVB_CMD_LOG_READ          = 31,    /* arg0 from, arg1 max; out: thv_log_info, bytes @ARRAY_OFF; ret0 got       */
     THVB_CMD_TRUST_QUERY       = 32,    /* out: thv_trust_list (read only: the broker never asks for trust)         */
-    THVB_CMD_SHUTDOWN          = 33     /* the broker exits after answering                                        */
+    THVB_CMD_SHUTDOWN          = 33,    /* the broker exits after answering                                        */
+    /* turing-hv rev146b (SDK 1.8): the data watch -- "find out what writes / accesses this address" */
+    THVB_CMD_DWATCH_ARM        = 34,    /* arg0 cr3, arg1 address, arg2 length, arg3 kind; out: thv_dwatch_status;
+                                           ret0 id                                                                  */
+    THVB_CMD_DWATCH_READ       = 35,    /* arg0 id, arg1 first, arg2 max; out: status, thv_dwatch_entry[] @ARRAY_OFF */
+    THVB_CMD_DWATCH_CLEAR      = 36,    /* arg0 id (0 = all); out: thv_dwatch_status                                */
+    /* turing-hv rev147 (SDK 1.9): the instruction watch -- "find out what addresses this instruction accesses" */
+    THVB_CMD_DWATCH_ARM_EXEC   = 37,    /* arg0 cr3, arg1 instruction, arg2 its length, arg3 flags (rev147b:
+                                           THV_DWATCH_HARD or 0); in: thv_dwatch_operand; out: thv_dwatch_status;
+                                           ret0 id                                                                  */
+    /* turing-hv rev148 (SDK 1.11): the capture breakpoint -- snapshot every value at an instruction, then disarm */
+    THVB_CMD_DWATCH_ARM_CAPTURE = 38,   /* arg0 cr3, arg1 instruction, arg2 length; in: thv_dwatch_operand @0 +
+                                           thv_capture_cfg @THVB_ARRAY_OFF; out: thv_dwatch_status; ret0 id          */
+    THVB_CMD_DWATCH_CAP_READ    = 39,   /* arg0 id, arg1 index; out: thv_dwatch_status @0, thv_capture_rec @ARRAY_OFF */
+    /* turing-hv rev149 (SDK 1.12): the parking breakpoint -- stop a thread at an instruction, step / continue it */
+    THVB_CMD_DWATCH_ARM_BREAK   = 40,   /* arg0 cr3, arg1 instruction, arg2 length; in: thv_dwatch_operand @0;
+                                           out: thv_dwatch_status; ret0 id                                          */
+    THVB_CMD_DWATCH_BK_READ     = 41,   /* arg0 id, arg1 index; out: thv_dwatch_status @0, thv_capture_rec @ARRAY_OFF */
+    THVB_CMD_DWATCH_BK_CMD      = 42    /* arg0 id; in: thv_break_cmd @0; out: thv_dwatch_status                      */
 };
 
 #endif

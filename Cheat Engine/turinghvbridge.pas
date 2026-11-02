@@ -130,6 +130,47 @@ const
   THVB_CMD_LOG_READ          = 31;
   THVB_CMD_TRUST_QUERY       = 32;
   THVB_CMD_SHUTDOWN          = 33;
+  THVB_CMD_DWATCH_ARM        = 34;  //turing-hv rev146b (SDK 1.8): the data watch (nested page faults)
+  THVB_CMD_DWATCH_READ       = 35;
+  THVB_CMD_DWATCH_CLEAR      = 36;
+  THVB_CMD_DWATCH_ARM_EXEC   = 37;  //turing-hv rev147 (SDK 1.9): the instruction watch
+  THVB_CMD_DWATCH_ARM_CAPTURE = 38; //turing-hv rev148 (SDK 1.11): the capture breakpoint (snapshot and disarm)
+  THVB_CMD_DWATCH_CAP_READ    = 39;
+  THVB_CMD_DWATCH_ARM_BREAK   = 40; //turing-hv rev149 (SDK 1.12): the parking breakpoint (stop / step a thread)
+  THVB_CMD_DWATCH_BK_READ     = 41;
+  THVB_CMD_DWATCH_BK_CMD      = 42;
+
+  THV_DWATCH_WRITE  = 1;
+  THV_DWATCH_ACCESS = 3;
+  THV_DWATCH_LEN_MAX = 4096;
+  THV_DWATCH_E_READ  = 1;
+  THV_DWATCH_E_WRITE = 2;
+  THV_DWATCH_EXEC    = 4;   //rev147: the addresses one instruction accesses (DWatchArmExec)
+  THV_DWATCH_E_EXEC  = 4;
+  THV_DWATCH_SEG_FS  = 4;
+  THV_DWATCH_SEG_GS  = 5;
+  THV_DWATCH_HARD    = 1;   //rev147b (SDK 1.10): DWatchArmExec's flags: "watch harder" (100,000 steps a second)
+  THV_DWATCH_CAPTURE = 5;   //rev148 (SDK 1.11): the capture breakpoint (DWatchArmCapture / DWatchCapRead)
+  THV_CAP_STACK_MAX  = 512;
+  THV_CAP_CODE_MAX   = 256;
+  THV_CAP_DEREF_MAX  = 128;
+  THV_CAP_DEREFS     = 17;  //16 GPRs (RAX..R15) then the operand
+  THV_CAP_RECS       = 4;
+  THV_CAPF_SSE       = 1;
+  THV_CAPF_DEREF     = 2;
+  THV_CAPF_OPERAND   = 4;
+  THV_CAPF_IDENT     = 8;
+  //rev149: the parking breakpoint (DWatchArmBreak / DWatchBreakRead / DWatchBreakCmd)
+  THV_BKC_CONTINUE   = 1;
+  THV_BKC_STEP       = 2;   //step into
+  THV_BKC_STEPOVER   = 3;
+  THV_BKC_RUNTO      = 4;   //value = target RIP
+  THV_BKC_SETREG     = 5;   //reg 0..15 = value
+  THV_BKC_SETRIP     = 6;   //RIP = value
+  THV_BKC_RELEASE    = 7;
+  THV_BKS_HELD       = 0;   //stopped at the breakpoint
+  THV_BKS_STEPPING   = 1;   //a step / continue is in flight
+  THV_BKS_RANOUT     = 2;   //ran off the watched page; will re-park at the next hit
 
 type
   TThvConnectionInfo = record
@@ -331,6 +372,77 @@ type
   PThvWatchHit = ^TThvWatchHit;
   TThvWatchHitArray = array of TThvWatchHit;
 
+  { turing-hv rev146b: the data watch (thv_dwatch_status / thv_dwatch_entry) }
+  TThvDWatchStatus = record
+    supported, id, active, pages: dword;
+    hits, other, elsewhere, dropped, unstepped: qword;
+    entries, count, throttled, paused: dword;
+    tsc_hz: qword;
+  end;
+  PThvDWatchStatus = ^TThvDWatchStatus;
+  TThvDWatchEntry = record
+    rip, count, cr3, rflags, rsp, addr: qword;   //rip: the accessing instruction; addr: what its first hit accessed
+    gpr: array[0..15] of qword;   //RAX RCX RDX RBX RSP RBP RSI RDI R8..R15 at the first hit, before it ran
+    stack: array[0..7] of qword;
+    tsc: qword;
+    vcpu, cpl, nstack, flags: dword;   //flags: THV_DWATCH_E_READ / _WRITE over all its hits
+  end;
+  PThvDWatchEntry = ^TThvDWatchEntry;
+  TThvDWatchEntryArray = array of TThvDWatchEntry;
+  { turing-hv rev147: the instruction's memory operand (thv_dwatch_operand): the address one run of it accesses is
+    disp + gpr[reg[0]]*scale[0] + gpr[reg[1]]*scale[1] (+ the FS / GS base), worked out by the hypervisor }
+  TThvDWatchOperand = record
+    disp: int64;
+    scale: array[0..1] of int64;   //0 = no term
+    reg: array[0..1] of byte;      //0..15: RAX RCX RDX RBX RSP RBP RSI RDI R8..R15
+    seg: byte;                     //0, THV_DWATCH_SEG_FS or THV_DWATCH_SEG_GS
+    rsvd: array[0..4] of byte;
+  end;
+
+  { turing-hv rev148: the capture breakpoint (thv_capture_cfg / thv_capture_rec) }
+  TThvCaptureCfg = record
+    max_hits: dword;               //captures before disarm (0 -> 1); last THV_CAP_RECS kept
+    flags: dword;                  //THV_CAPF_*
+    stack_bytes: dword;            //0..THV_CAP_STACK_MAX
+    code_before: dword;            //code_before + code_after <= THV_CAP_CODE_MAX
+    code_after: dword;
+    deref_bytes: dword;            //0..THV_CAP_DEREF_MAX per slot
+    rsvd: array[0..1] of dword;
+  end;
+  PThvCaptureCfg = ^TThvCaptureCfg;
+  TThvCaptureSeg = record
+    base: qword;
+    limit: dword;
+    sel, attrib: word;
+  end;
+  TThvCaptureRec = record
+    seq: qword;                    //1.. ; 0 = empty
+    rip, rflags, rsp, cr2, cr3, efer, xcr0, dr6, dr7: qword;
+    gpr: array[0..15] of qword;    //RAX RCX RDX RBX RSP RBP RSI RDI R8..R15
+    fs_base, gs_base, kernel_gs_base: qword;
+    cs, ss, ds, es, fs, gs: TThvCaptureSeg;
+    operand_addr: qword;
+    tsc: qword;
+    pid, tid: qword;
+    vcpu, cpl, flags: dword;       //flags: THV_CAPF_* actually captured
+    stack_len, code_len, code_before: dword;   //code_before = RIP's byte index in code
+    deref_len: array[0..THV_CAP_DEREFS-1] of dword;
+    xmm: array[0..255] of byte;
+    fxsave_hdr: array[0..31] of byte;   //FCW FSW FTW FOP FIP FDP MXCSR MXCSR_MASK
+    stack: array[0..THV_CAP_STACK_MAX-1] of byte;
+    code: array[0..THV_CAP_CODE_MAX-1] of byte;
+    deref: array[0..THV_CAP_DEREFS-1, 0..THV_CAP_DEREF_MAX-1] of byte;
+  end;
+  PThvCaptureRec = ^TThvCaptureRec;
+
+  { rev149: a command to a parked thread (thv_break_cmd) }
+  TThvBreakCmd = record
+    tid: qword;           //the parked thread (TThvCaptureRec.tid); 0 = the most recently parked
+    cmd: dword;           //THV_BKC_*
+    reg: dword;           //THV_BKC_SETREG: 0..15
+    value: qword;         //SETREG / SETRIP value, or RUNTO target
+  end;
+
   TThvSlatPage = record
     va, pa: qword;
     flags, reserved: dword;
@@ -452,12 +564,15 @@ type
     fTimeout: dword;
     function shared: PThvbShared;
   public
+    { the THV_CLIENT_API_VERSION the running thvbridge.exe was built against (0 = no bridge) }
+    function BrokerSdkVersion: dword;
     function slotHdr(i: integer): PThvbSlot;
     function slotData(i: integer): PByte;
     function Acquire: integer;
     procedure Release(i: integer);
     { runs one request on an acquired slot; data[] must already hold in_len input bytes }
     function Exec(i: integer; cmd: dword; const args: array of qword; inlen: dword=0): dword;
+    function ExecRaw(i: integer; cmd: dword; const args: array of qword; inlen: dword): dword;
     { a return value of the last Exec on slot i -- 0 unless that request completed }
     function rv(i, k: integer): qword;
     { did the last Exec on slot i get the answer to its own request?  (output structs are only read then) }
@@ -496,6 +611,19 @@ type
     function WWatchArm(cr3, address, length: qword; flags: dword; out st: TThvXWatchStatus; out pages: TThvQWordArray; pagecap: integer=64): dword;
     function WWatchRead(from: dword; max: integer; out st: TThvXWatchStatus; out hits: TThvWatchHitArray): dword;
     function WWatchClear(out st: TThvXWatchStatus): dword;
+    { turing-hv rev146b: the data watch -- kind THV_DWATCH_WRITE / THV_DWATCH_ACCESS, 1..4096 bytes }
+    function DWatchArm(cr3, address: qword; length, kind: dword; out id: dword; out st: TThvDWatchStatus): dword;
+    function DWatchRead(id, first: dword; max: integer; out st: TThvDWatchStatus; out entries: TThvDWatchEntryArray): dword;
+    function DWatchClear(id: dword; out st: TThvDWatchStatus): dword;
+    { turing-hv rev147: the instruction watch -- the instruction at `address` (`length` bytes), its operand }
+    function DWatchArmExec(cr3, address: qword; length: dword; const op: TThvDWatchOperand; flags: dword; out id: dword; out st: TThvDWatchStatus): dword;
+    { turing-hv rev148: the capture breakpoint -- snapshot every value at `address`, then disarm }
+    function DWatchArmCapture(cr3, address: qword; length: dword; const op: TThvDWatchOperand; const cfg: TThvCaptureCfg; out id: dword; out st: TThvDWatchStatus): dword;
+    function DWatchCapRead(id, index: dword; out st: TThvDWatchStatus; out rec: TThvCaptureRec): dword;
+    { turing-hv rev149: the parking breakpoint -- stop / step a thread at `address` }
+    function DWatchArmBreak(cr3, address: qword; length: dword; const op: TThvDWatchOperand; out id: dword; out st: TThvDWatchStatus): dword;
+    function DWatchBreakRead(id, index: dword; out st: TThvDWatchStatus; out rec: TThvCaptureRec): dword;
+    function DWatchBreakCmd(id: dword; const c: TThvBreakCmd; out st: TThvDWatchStatus): dword;
     function SlatQuery(cr3, address: qword; pages: integer; out list: array of TThvSlatPage; out slat: dword; out got: integer): dword;
     function LogRead(from: qword; max: dword; out text: ansistring; out info: TThvLogInfo): dword;
     function TrustQuery(out list: TThvTrustList): dword;
@@ -511,6 +639,16 @@ type
 
 function thvStatusString(status: dword): string;
 function thvCr3MethodName(m: dword): string;
+
+const
+  THVB_STAT_CMDS = 64;
+var
+  { What the bridge has been asked, per command: requests and the microseconds they took end to end (the shared
+    channel, the broker, the hypervisor).  Read by turinghv_bridgeStats() and the status window. }
+  thvStatCount: array[0..THVB_STAT_CMDS-1] of int64;
+  thvStatMicros: array[0..THVB_STAT_CMDS-1] of int64;
+procedure thvStatsReset;
+function thvCmdName(cmd: dword): string;
 
 {$endif}
 
@@ -546,6 +684,28 @@ begin
   else
     result:='status '+inttostr(status);
   end;
+end;
+
+var thvQpcFreq: int64;
+
+procedure thvStatsReset;
+var k: integer;
+begin
+  for k:=0 to THVB_STAT_CMDS-1 do
+  begin
+    InterlockedExchange64(thvStatCount[k], 0);
+    InterlockedExchange64(thvStatMicros[k], 0);
+  end;
+end;
+
+function thvCmdName(cmd: dword): string;
+const names: array[1..36] of string = ('ping','connection_info','get_access','reopen','status','intro_diag',
+  'process_info','read','write','read_phys','read_scatter','write_scatter','read_phys_scatter','enum_processes',
+  'enum_kmodules','enum_umodules','enum_threads','enum_memory','phys_ranges','cr3_query','cr3_watch','cr3_scan_step',
+  'xwatch_arm','xwatch_arm_deref','xwatch_read','xwatch_clear','wwatch_arm','wwatch_read','wwatch_clear',
+  'slat_query','log_read','trust_query','shutdown','dwatch_arm','dwatch_read','dwatch_clear');
+begin
+  if (cmd>=1) and (cmd<=36) then result:=names[cmd] else result:='cmd'+inttostr(cmd);
 end;
 
 function thvCr3MethodName(m: dword): string;
@@ -587,6 +747,13 @@ begin
   need(sizeof(TThvAccess),288,'thv_access');
   need(sizeof(TThvXWatchStatus),32,'thv_xwatch_status');
   need(sizeof(TThvWatchHit),272,'thv_watch_hit');
+  need(sizeof(TThvDWatchStatus),80,'thv_dwatch_status');
+  need(sizeof(TThvDWatchEntry),264,'thv_dwatch_entry');
+  need(sizeof(TThvDWatchOperand),32,'thv_dwatch_operand');
+  need(sizeof(TThvCaptureCfg),32,'thv_capture_cfg');
+  need(sizeof(TThvCaptureSeg),16,'thv_capture_seg');
+  need(sizeof(TThvCaptureRec),3688,'thv_capture_rec');
+  need(sizeof(TThvBreakCmd),24,'thv_break_cmd');
   need(sizeof(TThvSlatPage),24,'thv_slat_page');
   need(sizeof(TThvLogInfo),32,'thv_log_info');
   need(sizeof(TThvTrustEntry),292,'thv_trust_entry');
@@ -607,6 +774,12 @@ end;
 function TThvBridge.shared: PThvbShared;
 begin
   result:=PThvbShared(fView);
+end;
+
+function TThvBridge.BrokerSdkVersion: dword;
+begin
+  if fView=nil then exit(0);
+  result:=shared^.sdk_api_version;
 end;
 
 function TThvBridge.slotHdr(i: integer): PThvbSlot;
@@ -843,6 +1016,19 @@ begin
 end;
 
 function TThvBridge.Exec(i: integer; cmd: dword; const args: array of qword; inlen: dword): dword;
+var t0, t1: int64;
+begin
+  QueryPerformanceCounter(t0);
+  result:=ExecRaw(i, cmd, args, inlen);
+  QueryPerformanceCounter(t1);
+  if cmd<THVB_STAT_CMDS then
+  begin
+    InterlockedIncrement64(thvStatCount[cmd]);
+    if thvQpcFreq>0 then InterlockedExchangeAdd64(thvStatMicros[cmd], ((t1-t0)*1000000) div thvQpcFreq);
+  end;
+end;
+
+function TThvBridge.ExecRaw(i: integer; cmd: dword; const args: array of qword; inlen: dword): dword;
 var
   h: PThvbSlot;
   k: integer;
@@ -1513,6 +1699,166 @@ begin
   end;
 end;
 
+function TThvBridge.DWatchArm(cr3, address: qword; length, kind: dword; out id: dword; out st: TThvDWatchStatus): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  id:=0;
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    result:=Exec(i, THVB_CMD_DWATCH_ARM, [cr3, address, length, kind]);
+    if completed(i) then
+    begin
+      st:=PThvDWatchStatus(slotData(i))^;
+      if result=THV_OK then id:=dword(rv(i,0));
+    end;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.DWatchRead(id, first: dword; max: integer; out st: TThvDWatchStatus; out entries: TThvDWatchEntryArray): dword;
+var i, n: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  setlength(entries,0);
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    result:=Exec(i, THVB_CMD_DWATCH_READ, [id, first, max]);
+    if completed(i) then st:=PThvDWatchStatus(slotData(i))^;
+    n:=integer(min(min(rv(i,0), qword(max)), qword((fData-THVB_ARRAY_OFF) div sizeof(TThvDWatchEntry))));
+    setlength(entries,n);
+    if n>0 then move((slotData(i)+THVB_ARRAY_OFF)^, entries[0], n*sizeof(TThvDWatchEntry));
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.DWatchClear(id: dword; out st: TThvDWatchStatus): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    result:=Exec(i, THVB_CMD_DWATCH_CLEAR, [id]);
+    if completed(i) then st:=PThvDWatchStatus(slotData(i))^;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.DWatchArmExec(cr3, address: qword; length: dword; const op: TThvDWatchOperand; flags: dword; out id: dword; out st: TThvDWatchStatus): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  id:=0;
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    move(op, slotData(i)^, sizeof(op));
+    result:=Exec(i, THVB_CMD_DWATCH_ARM_EXEC, [cr3, address, length, flags], sizeof(op));
+    if completed(i) then
+    begin
+      st:=PThvDWatchStatus(slotData(i))^;
+      if result=THV_OK then id:=dword(rv(i,0));
+    end;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.DWatchArmCapture(cr3, address: qword; length: dword; const op: TThvDWatchOperand; const cfg: TThvCaptureCfg; out id: dword; out st: TThvDWatchStatus): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  id:=0;
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    //the operand at offset 0, the config at THVB_ARRAY_OFF (the broker reads it there)
+    zeromemory(slotData(i), THVB_ARRAY_OFF+sizeof(cfg));
+    move(op, slotData(i)^, sizeof(op));
+    move(cfg, (slotData(i)+THVB_ARRAY_OFF)^, sizeof(cfg));
+    result:=Exec(i, THVB_CMD_DWATCH_ARM_CAPTURE, [cr3, address, length], THVB_ARRAY_OFF+sizeof(cfg));
+    if completed(i) then
+    begin
+      st:=PThvDWatchStatus(slotData(i))^;
+      if result=THV_OK then id:=dword(rv(i,0));
+    end;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.DWatchCapRead(id, index: dword; out st: TThvDWatchStatus; out rec: TThvCaptureRec): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  zeromemory(@rec,sizeof(rec));
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    result:=Exec(i, THVB_CMD_DWATCH_CAP_READ, [id, index]);
+    if completed(i) then
+    begin
+      st:=PThvDWatchStatus(slotData(i))^;
+      if (result=THV_OK) and (index<st.count) and (fData>=THVB_ARRAY_OFF+sizeof(rec)) then
+        move((slotData(i)+THVB_ARRAY_OFF)^, rec, sizeof(rec));
+    end;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.DWatchArmBreak(cr3, address: qword; length: dword; const op: TThvDWatchOperand; out id: dword; out st: TThvDWatchStatus): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  id:=0;
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    move(op, slotData(i)^, sizeof(op));
+    result:=Exec(i, THVB_CMD_DWATCH_ARM_BREAK, [cr3, address, length], sizeof(op));
+    if completed(i) then
+    begin
+      st:=PThvDWatchStatus(slotData(i))^;
+      if result=THV_OK then id:=dword(rv(i,0));
+    end;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.DWatchBreakRead(id, index: dword; out st: TThvDWatchStatus; out rec: TThvCaptureRec): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  zeromemory(@rec,sizeof(rec));
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    result:=Exec(i, THVB_CMD_DWATCH_BK_READ, [id, index]);
+    if completed(i) then
+    begin
+      st:=PThvDWatchStatus(slotData(i))^;
+      if (result=THV_OK) and (index<st.count) and (fData>=THVB_ARRAY_OFF+sizeof(rec)) then
+        move((slotData(i)+THVB_ARRAY_OFF)^, rec, sizeof(rec));
+    end;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.DWatchBreakCmd(id: dword; const c: TThvBreakCmd; out st: TThvDWatchStatus): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    move(c, slotData(i)^, sizeof(c));
+    result:=Exec(i, THVB_CMD_DWATCH_BK_CMD, [id], sizeof(c));
+    if completed(i) then st:=PThvDWatchStatus(slotData(i))^;
+  finally
+    Release(i);
+  end;
+end;
+
 function TThvBridge.SlatQuery(cr3, address: qword; pages: integer; out list: array of TThvSlatPage; out slat: dword; out got: integer): dword;
 var i, n: integer;
 begin
@@ -1562,6 +1908,9 @@ begin
     Release(i);
   end;
 end;
+
+initialization
+  QueryPerformanceFrequency(thvQpcFreq);
 
 {$endif}
 

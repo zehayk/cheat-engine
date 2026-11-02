@@ -26,7 +26,7 @@ implementation
 
 uses
   turinghvport, turinghvbridge, turinghvwatch, ceregistry, ProcessHandlerUnit, pluginexports, MainUnit,
-  strutils, math;
+  MemoryBrowserFormUnit, Spin, strutils, math;
 
 const
   REG_ENABLED   = 'TuringHV.EnableAtStartup';
@@ -34,20 +34,42 @@ const
   REG_FALLBACK  = 'TuringHV.OSFallback';
   REG_SHAREDW   = 'TuringHV.SharedCodeWrites';
   REG_SLOWCR3   = 'TuringHV.SlowCR3';
+  REG_HARDER    = 'TuringHV.WatchHarder';
+  REG_CAP_STACK = 'TuringHV.CapStackBytes';
+  REG_CAP_CB    = 'TuringHV.CapCodeBefore';
+  REG_CAP_CA    = 'TuringHV.CapCodeAfter';
+  REG_CAP_DEREF = 'TuringHV.CapDerefBytes';
+  REG_CAP_REGS  = 'TuringHV.CapFollowRegs';
+  REG_CAP_OPND  = 'TuringHV.CapOperand';
+  REG_CAP_SSE   = 'TuringHV.CapSSE';
+  REG_CAP_IDENT = 'TuringHV.CapIdent';
+  REG_CAP_MAX   = 'TuringHV.CapMaxHits';
 
 type
   TTuringHVMenu = class
   public
-    root, miEnable, miStatus, miWatch, miOSHandle, miFallback, miShared, miSlow, miStartup: TMenuItem;
-    popupWatch: TMenuItem;
-    oldPopup: TNotifyEvent;
+    root, miEnable, miStatus, miWatch, miAccess, miOSHandle, miFallback, miShared, miSlow, miStartup: TMenuItem;
+    miHarder: TMenuItem;            //rev147b: "watch harder" for the instruction watch
+    miCapSettings: TMenuItem;       //rev148: the capture breakpoint's snapshot settings
+    popupWatch, popupAccess: TMenuItem;
+    popupInstr: TMenuItem;          //rev147: the memory viewer's "what addresses this instruction accesses"
+    popupCapture: TMenuItem;        //rev148: the memory viewer's "capture a snapshot here"
+    popupBreak: TMenuItem;          //rev149: the memory viewer's "set a parking breakpoint here"
+    oldPopup, oldDbgPopup: TNotifyEvent;
     procedure EnableClick(Sender: TObject);
     procedure StatusClick(Sender: TObject);
     procedure WatchClick(Sender: TObject);
+    procedure AccessClick(Sender: TObject);
     procedure OptionClick(Sender: TObject);
     procedure RootClick(Sender: TObject);
     procedure PopupMenu2Popup(Sender: TObject);
     procedure StartupTimer(Sender: TObject);
+    procedure InstrClick(Sender: TObject);
+    procedure CaptureClick(Sender: TObject);
+    procedure BreakClick(Sender: TObject);
+    procedure CaptureSettingsClick(Sender: TObject);
+    procedure DebuggerPopupPopup(Sender: TObject);
+    procedure MemoryBrowserTimer(Sender: TObject);
   end;
 
   TfrmTuringHV = class(TForm)
@@ -122,6 +144,16 @@ begin
   cereg.writeBool(REG_FALLBACK, thvOptOSFallback);
   cereg.writeBool(REG_SHAREDW, thvOptSharedCodeWrites);
   cereg.writeBool(REG_SLOWCR3, thvOptSlowCr3);
+  cereg.writeBool(REG_HARDER, thvOptWatchHarder);
+  cereg.writeInteger(REG_CAP_STACK, integer(thvCapStackBytes));
+  cereg.writeInteger(REG_CAP_CB, integer(thvCapCodeBefore));
+  cereg.writeInteger(REG_CAP_CA, integer(thvCapCodeAfter));
+  cereg.writeInteger(REG_CAP_DEREF, integer(thvCapDerefBytes));
+  cereg.writeBool(REG_CAP_REGS, thvCapFollowRegs);
+  cereg.writeBool(REG_CAP_OPND, thvCapOperand);
+  cereg.writeBool(REG_CAP_SSE, thvCapSSE);
+  cereg.writeBool(REG_CAP_IDENT, thvCapIdent);
+  cereg.writeInteger(REG_CAP_MAX, integer(thvCapMaxHits));
 end;
 
 procedure TTuringHVMenu.EnableClick(Sender: TObject);
@@ -149,6 +181,20 @@ begin
   TuringHV_FindWhatWrites(address, size);
 end;
 
+procedure TTuringHVMenu.AccessClick(Sender: TObject);
+var address: ptruint; size: integer;
+begin
+  if mainform.addresslist.selectedRecord=nil then
+  begin
+    MessageDlg('Select an entry in the address list first.', mtInformation, [mbOK], 0);
+    exit;
+  end;
+  address:=mainform.addresslist.selectedRecord.GetRealAddress;
+  size:=mainform.addresslist.selectedRecord.bytesize;
+  if size<=0 then size:=4;
+  TuringHV_FindWhatAccesses(address, size);
+end;
+
 procedure TTuringHVMenu.OptionClick(Sender: TObject);
 var mi: TMenuItem;
 begin
@@ -165,6 +211,7 @@ begin
     thvOptSharedCodeWrites:=mi.Checked;
   end else
   if mi=miSlow then thvOptSlowCr3:=mi.Checked else
+  if mi=miHarder then thvOptWatchHarder:=mi.Checked else
   if mi=miStartup then cereg.writeBool(REG_ENABLED, mi.Checked);
   saveOptions;
 end;
@@ -173,12 +220,151 @@ procedure TTuringHVMenu.RootClick(Sender: TObject);
 begin
   miEnable.Checked:=TuringHV_Active;
   miWatch.Enabled:=TuringHV_Active and (processhandler.processid<>0);
+  miAccess.Enabled:=miWatch.Enabled;
 end;
 
 procedure TTuringHVMenu.PopupMenu2Popup(Sender: TObject);
 begin
   if assigned(oldPopup) then oldPopup(Sender);
   popupWatch.Visible:=TuringHV_Active and (mainform.addresslist.selectedRecord<>nil);
+  popupAccess.Visible:=popupWatch.Visible;
+end;
+
+procedure TTuringHVMenu.InstrClick(Sender: TObject);
+begin
+  if MemoryBrowser<>nil then
+    TuringHV_FindWhatAddressesInstructionAccesses(MemoryBrowser.disassemblerview.SelectedAddress);
+end;
+
+procedure TTuringHVMenu.CaptureClick(Sender: TObject);
+begin
+  if MemoryBrowser<>nil then
+    TuringHV_CaptureHere(MemoryBrowser.disassemblerview.SelectedAddress);
+end;
+
+procedure TTuringHVMenu.BreakClick(Sender: TObject);
+begin
+  if MemoryBrowser<>nil then
+    TuringHV_BreakpointHere(MemoryBrowser.disassemblerview.SelectedAddress);
+end;
+
+{ rev148: a small modal dialog for the capture breakpoint's snapshot -- what and how much to save }
+function captureSettingsDialog: boolean;
+var
+  f: TForm;
+  function spin(parent: TWinControl; const cap: string; y, val, min, max: integer; out ed: TSpinEdit): integer;
+  var l: TLabel;
+  begin
+    l:=TLabel.Create(f); l.Parent:=parent; l.Left:=16; l.Top:=y+3; l.Caption:=cap;
+    ed:=TSpinEdit.Create(f); ed.Parent:=parent; ed.Left:=230; ed.Top:=y; ed.Width:=80;
+    ed.MinValue:=min; ed.MaxValue:=max; ed.Value:=val;
+    result:=y+28;
+  end;
+  function chk(parent: TWinControl; const cap: string; y: integer; on: boolean; out cb: TCheckBox): integer;
+  begin
+    cb:=TCheckBox.Create(f); cb.Parent:=parent; cb.Left:=16; cb.Top:=y; cb.Width:=360; cb.Caption:=cap; cb.Checked:=on;
+    result:=y+24;
+  end;
+var
+  edStack, edCB, edCA, edDeref, edMax: TSpinEdit;
+  cbRegs, cbOpnd, cbSSE, cbIdent: TCheckBox;
+  ok, cancel: TButton;
+  y: integer;
+begin
+  result:=false;
+  f:=TForm.CreateNew(nil);
+  try
+    f.Caption:='Capture breakpoint settings (Turing-HV)';
+    f.BorderStyle:=bsDialog; f.Position:=poScreenCenter; f.ClientWidth:=340; f.ClientHeight:=330;
+    y:=12;
+    y:=spin(f, 'Stack bytes from RSP (0-512):', y, integer(thvCapStackBytes), 0, THV_CAP_STACK_MAX, edStack);
+    y:=spin(f, 'Code bytes before RIP (0-256):', y, integer(thvCapCodeBefore), 0, THV_CAP_CODE_MAX, edCB);
+    y:=spin(f, 'Code bytes from RIP (0-256):', y, integer(thvCapCodeAfter), 0, THV_CAP_CODE_MAX, edCA);
+    y:=spin(f, 'Bytes at each pointer (0-128):', y, integer(thvCapDerefBytes), 0, THV_CAP_DEREF_MAX, edDeref);
+    y:=spin(f, 'Captures before disarm (1-4 kept):', y, integer(thvCapMaxHits), 1, 64, edMax);
+    y:=y+6;
+    y:=chk(f, 'Follow every register that looks like a pointer', y, thvCapFollowRegs, cbRegs);
+    y:=chk(f, 'Follow the instruction''s memory operand', y, thvCapOperand, cbOpnd);
+    y:=chk(f, 'Capture SSE / XMM and the FPU control words', y, thvCapSSE, cbSSE);
+    y:=chk(f, 'Read the thread''s PID / TID (user-mode hits)', y, thvCapIdent, cbIdent);
+    ok:=TButton.Create(f); ok.Parent:=f; ok.Caption:='OK'; ok.ModalResult:=mrOK;
+    ok.Width:=80; ok.Top:=f.ClientHeight-34; ok.Left:=f.ClientWidth-176;
+    cancel:=TButton.Create(f); cancel.Parent:=f; cancel.Caption:='Cancel'; cancel.ModalResult:=mrCancel;
+    cancel.Width:=80; cancel.Top:=ok.Top; cancel.Left:=f.ClientWidth-88;
+    f.ActiveControl:=edStack;
+    if f.ShowModal<>mrOK then exit;
+    thvCapStackBytes:=dword(edStack.Value) and dword(not 7);
+    thvCapCodeBefore:=dword(edCB.Value);
+    thvCapCodeAfter:=dword(edCA.Value);
+    if thvCapCodeBefore+thvCapCodeAfter>THV_CAP_CODE_MAX then thvCapCodeAfter:=THV_CAP_CODE_MAX-thvCapCodeBefore;
+    thvCapDerefBytes:=dword(edDeref.Value);
+    thvCapMaxHits:=dword(edMax.Value); if thvCapMaxHits=0 then thvCapMaxHits:=1;
+    thvCapFollowRegs:=cbRegs.Checked;
+    thvCapOperand:=cbOpnd.Checked;
+    thvCapSSE:=cbSSE.Checked;
+    thvCapIdent:=cbIdent.Checked;
+    result:=true;
+  finally
+    f.Free;
+  end;
+end;
+
+procedure TTuringHVMenu.CaptureSettingsClick(Sender: TObject);
+begin
+  if captureSettingsDialog then saveOptions;
+end;
+
+procedure TTuringHVMenu.DebuggerPopupPopup(Sender: TObject);
+var on: boolean;
+begin
+  if assigned(oldDbgPopup) then oldDbgPopup(Sender);
+  on:=TuringHV_Active and (TuringHV_Target(processhandler.processhandle)<>nil);
+  if popupInstr<>nil then popupInstr.Visible:=on;
+  if popupCapture<>nil then popupCapture.Visible:=on;
+  if popupBreak<>nil then popupBreak.Visible:=on;
+end;
+
+{the memory viewer is created after the main form (whose FormCreate installs the rest): its item goes in once the
+ message loop runs and the form exists}
+procedure TTuringHVMenu.MemoryBrowserTimer(Sender: TObject);
+var
+  anchor: TMenuItem;
+  parent: TMenuItem;
+begin
+  if MemoryBrowser=nil then exit;     //not yet: the timer comes back
+  TTimer(Sender).Enabled:=false;
+  anchor:=MemoryBrowser.Findoutwhataddressesthisinstructionaccesses1;
+  parent:=anchor.Parent;
+  popupInstr:=TMenuItem.Create(MemoryBrowser);
+  popupInstr.Caption:='Find out what addresses this instruction accesses (Turing-HV)';
+  popupInstr.OnClick:=InstrClick;
+  popupInstr.ImageIndex:=anchor.ImageIndex;
+  popupInstr.Visible:=false;
+  popupCapture:=TMenuItem.Create(MemoryBrowser);
+  popupCapture.Caption:='Capture a snapshot here, then disarm (Turing-HV)';
+  popupCapture.OnClick:=CaptureClick;
+  popupCapture.ImageIndex:=anchor.ImageIndex;
+  popupCapture.Visible:=false;
+  popupBreak:=TMenuItem.Create(MemoryBrowser);
+  popupBreak.Caption:='Set a parking breakpoint here (Turing-HV)';
+  popupBreak.OnClick:=BreakClick;
+  popupBreak.ImageIndex:=anchor.ImageIndex;
+  popupBreak.Visible:=false;
+  if parent<>nil then
+  begin
+    parent.Insert(parent.IndexOf(anchor)+1, popupInstr);
+    parent.Insert(parent.IndexOf(popupInstr)+1, popupCapture);
+    parent.Insert(parent.IndexOf(popupCapture)+1, popupBreak);
+  end
+  else
+  begin
+    MemoryBrowser.debuggerpopup.Items.Add(popupInstr);
+    MemoryBrowser.debuggerpopup.Items.Add(popupCapture);
+    MemoryBrowser.debuggerpopup.Items.Add(popupBreak);
+  end;
+  oldDbgPopup:=MemoryBrowser.debuggerpopup.OnPopup;
+  MemoryBrowser.debuggerpopup.OnPopup:=DebuggerPopupPopup;
+  TTimer(Sender).Free;
 end;
 
 procedure TTuringHVMenu.StartupTimer(Sender: TObject);
@@ -211,6 +397,17 @@ begin
   thvOptOSFallback:=cereg.readBool(REG_FALLBACK, false);
   thvOptSharedCodeWrites:=cereg.readBool(REG_SHAREDW, false);
   thvOptSlowCr3:=cereg.readBool(REG_SLOWCR3, true);
+  thvOptWatchHarder:=cereg.readBool(REG_HARDER, false);
+  thvCapStackBytes:=dword(cereg.readInteger(REG_CAP_STACK, 256));
+  thvCapCodeBefore:=dword(cereg.readInteger(REG_CAP_CB, 32));
+  thvCapCodeAfter:=dword(cereg.readInteger(REG_CAP_CA, 32));
+  thvCapDerefBytes:=dword(cereg.readInteger(REG_CAP_DEREF, 64));
+  thvCapFollowRegs:=cereg.readBool(REG_CAP_REGS, true);
+  thvCapOperand:=cereg.readBool(REG_CAP_OPND, true);
+  thvCapSSE:=cereg.readBool(REG_CAP_SSE, true);
+  thvCapIdent:=cereg.readBool(REG_CAP_IDENT, true);
+  thvCapMaxHits:=dword(cereg.readInteger(REG_CAP_MAX, 1));
+  if thvCapMaxHits=0 then thvCapMaxHits:=1;
 
   with menu do
   begin
@@ -223,8 +420,15 @@ begin
     miStatus:=newItem(mf, 'Status, logs and trusted programs...', StatusClick);
     root.Add(miStatus);
     sep:=TMenuItem.Create(mf); sep.Caption:='-'; root.Add(sep);
-    miWatch:=newItem(mf, 'Find out what writes to the selected address (hypervisor write watch, sampled)...', WatchClick);
+    miWatch:=newItem(mf, 'Find out what writes to the selected address (hypervisor)...', WatchClick);
     root.Add(miWatch);
+    miAccess:=newItem(mf, 'Find out what accesses the selected address (hypervisor)...', AccessClick);
+    root.Add(miAccess);
+    miHarder:=newItem(mf, 'Instruction watch: watch harder (100,000 steps a second instead of 20,000 -- the game stutters while it runs)', OptionClick);
+    miHarder.Checked:=thvOptWatchHarder;
+    root.Add(miHarder);
+    miCapSettings:=newItem(mf, 'Capture breakpoint: snapshot settings...', CaptureSettingsClick);
+    root.Add(miCapSettings);
     sep:=TMenuItem.Create(mf); sep.Caption:='-'; root.Add(sep);
 
     miOSHandle:=newItem(mf, 'Also open a query-only Windows handle (compatibility; visible to the target)', OptionClick);
@@ -254,9 +458,18 @@ begin
     popupWatch:=newItem(mf, 'Find out what writes to this address (Turing-HV write watch)', WatchClick);
     popupWatch.Visible:=false;
     mf.PopupMenu2.Items.Insert(mf.PopupMenu2.Items.IndexOf(mf.miDBVMFindWhatWritesOrAccesses)+1, popupWatch);
+    popupAccess:=newItem(mf, 'Find out what accesses this address (Turing-HV access watch)', AccessClick);
+    popupAccess.Visible:=false;
+    mf.PopupMenu2.Items.Insert(mf.PopupMenu2.Items.IndexOf(popupWatch)+1, popupAccess);
     oldPopup:=mf.PopupMenu2.OnPopup;
     mf.PopupMenu2.OnPopup:=PopupMenu2Popup;
   end;
+
+  //the memory viewer's disassembler popup (rev147), once the memory viewer exists
+  t:=TTimer.Create(nil);
+  t.Interval:=200;
+  t.OnTimer:=menu.MemoryBrowserTimer;
+  t.Enabled:=true;
 
   if menu.miStartup.Checked then
   begin

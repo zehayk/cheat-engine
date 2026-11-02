@@ -145,8 +145,9 @@ The **Turing-HV** menu also has:
 - **Status, logs and trusted programs…**: the session, hypervisor status, the current target (CR3 and how it was found,
   PEB, bitness, handle kind, modules, regions), Cheat Engine's backend log, the hypervisor's own text log (live), and
   the operator trust list (read only).
-- **Find out what writes to the selected address (hypervisor write watch, sampled)…**: also in the address list's
-  right-click menu.
+- **Find out what writes to the selected address (hypervisor)…** and **Find out what accesses the selected address
+  (hypervisor)…**: also in the address list's right-click menu ("… (Turing-HV write watch)" / "… (Turing-HV access
+  watch)"). See §3 and §4.
 - Options:
   - *Also open a query-only Windows handle* (default **on**): compatibility. The target can see such a handle; turn it
     off for none at all.
@@ -174,7 +175,12 @@ kernel-driver settings are skipped (logged), because the hypervisor replaces the
 | `turinghv_getKernelModules()` | Kernel module list. |
 | `turinghv_slatQuery(addr, pages)` | Guest PTE and Hyper-V SLAT permissions per page. |
 | `turinghv_readLog(from)` | The hypervisor's text log. |
-| `turinghv_findWhatWrites(addr, size)` | Opens the sampled write-watch dialog. |
+| `turinghv_findWhatWrites(addr, size)` | Opens the write-watch dialog (the hypervisor's data watch; the sampled page watch on an older image or bridge). |
+| `turinghv_findWhatAccesses(addr, size)` | Opens the access-watch dialog (the data watch: every read or write). |
+| `turinghv_findWhatAddressesInstructionAccesses(addr)` | Opens the instruction watch's "accessed addresses" dialog; returns `ok, why` (no message box). |
+| `turinghv_captureHere(addr)` | Arms a capture breakpoint: snapshots every register, the stack, the code and the memory around `addr` the first time it runs, then disarms. Returns `ok, why`. |
+| `turinghv_setBreakpoint(addr)` | Arms a parking breakpoint: the first user-mode thread to reach `addr` stops in a window you can step / continue. Returns `ok, why`. |
+| `turinghv_bridgeStats([reset])` | Requests the bridge made since the last reset, per command, and the microseconds they took. |
 | `turinghv_getLog()` | Cheat Engine's backend log. |
 | `turinghv_showStatus()` | Opens the status window. |
 | `turinghv_getOption(name)` / `turinghv_setOption(name, bool)` | Options: OSHandle, OSFallback, SharedCodeWrites, SlowCR3. |
@@ -203,7 +209,11 @@ Everything below was verified end to end against the live hypervisor (§7), unle
 | Thread list | `ENUM_THREADS` | Thread IDs. Context, suspend and resume go through Windows `OpenThread` and work only if Windows allows it. |
 | 32/64-bit detection | PEB32 present | Also with no Windows handle. |
 | Auto assembler without `alloc` | writes | `define`/`aobscan` + writes into writable memory. Tested. |
-| "Find out what writes to this address" | write watch | **Sampled**, nested image only; see §4. Shows the writing instruction (RIP is the writer itself), RSP, RAX, RCX, RDX, R8, R9 and 16 stack qwords. Tested on 64- and 32-bit targets. |
+| "Find out what writes to this address" | data watch (turing-hv rev146b) | **Exact**: every write to the watched bytes, counted per instruction by the hypervisor, with all registers and 8 stack qwords of each instruction's first hit (before it ran). The instruction listed is the writer itself. Nested image only; see §4. On an image or bridge older than rev146b: the sampled page watch (writes only). |
+| "Find out what accesses this address" | data watch (rev146b) | The same for every read or write; each instruction is marked as reading, writing or both. |
+| "Find out what addresses this instruction accesses" | instruction watch (turing-hv rev147) | Memory viewer, right-click the instruction: the item marked "(Turing-HV)". Every run of the instruction, one line per address it accessed, with that address's run count and the registers of its first run (before it ran). Feeds Cheat Engine's own dialog (values, filter, "show registers", add to the address list). See §4 for the cost. |
+| "Capture a snapshot here, then disarm" | capture breakpoint (turing-hv rev148) | Memory viewer, right-click the instruction: "Capture a snapshot here, then disarm (Turing-HV)". The first time the instruction runs, a window shows every register, RFLAGS, the segments and FS/GS bases, the stack from RSP (each return address symbolized), the code around RIP (hex + a live disassembly), the memory each register and the operand point at, the thread's PID/TID, and XMM/MXCSR; then it disarms. What and how much to save is set in Turing-HV > "Capture breakpoint: snapshot settings...". Lua `turinghv_captureHere(addr)`. The one-shot cost is tens of microseconds; see §4. Does not stop the thread (unlike a debugger breakpoint). |
+| Breakpoint, step into / over, continue, run to cursor | parking breakpoint (turing-hv rev149) | Memory viewer, right-click the instruction: "Set a parking breakpoint here (Turing-HV)". The first user-mode thread that reaches it **stops** there (only that thread; the rest of the program runs on) and a debugger window shows its context with Step into / Step over / Continue / Run to cursor / Set register / Release and a dropdown of the stopped threads. No `int3`, no debug register, nothing the game can see -- the thread is held by re-faulting its code page. Stepping holds within the breakpoint's function page(s); step-over catches the call's return there. Lua `turinghv_setBreakpoint(addr)`. See §4. |
 | CR3 when EPROCESS lies | tracker → watch → sweep | For targets that scramble `DirectoryTableBase`. Tested with the DTB rung skipped (the tracker answered in 250 ms). |
 | Hypervisor status, text log, trust list | `STATUS`, `LOG_READ`, `TRUST_QUERY` | Status window. |
 | Target exit | liveness check | Reads and writes are refused afterwards. Tested with and without a Windows handle. |
@@ -224,10 +234,57 @@ Windows afterwards. This is Windows doing it, not the hypervisor.
 - **Region types are inferred.** Inside a module's range a region is `MEM_IMAGE`; everything else is `MEM_PRIVATE`.
   `MEM_MAPPED` is never reported, so CE's "scan MEM_MAPPED" option has nothing to exclude. A region's protection is
   the PTE's: an image `.data` page not yet copied-on-write shows `PAGE_READONLY`, not `PAGE_WRITECOPY`.
-- **The write watch is a sampler, not a breakpoint.** The hypervisor records the *first* write to an armed page, so a
-  poll thread re-arms every ~10 ms and keeps the hits that landed on the watched bytes, comparing physical addresses
-  (page-walker A/D writes are skipped). Counts are samples. A writer that runs only between re-arms can be missed. Registers
-  the hypervisor doesn't capture show 0.
+- **The data watch** (turing-hv rev146b) works on the hypervisor's nested page tables: the watched page is kept
+  read-only (a write watch) or out of reach (an access watch), so every write / access of it exits to the hypervisor.
+  It records the ones that touched the watched bytes (the access size is decoded from the instruction) and lets each
+  through by single-stepping that one instruction on its own vCPU; nothing of this is visible to Windows or the
+  target, and no debug register is used. The cost is per PAGE: every access to the page costs the game two exits,
+  whether or not it touches the watched bytes (the status line counts those "elsewhere"), so watching a value on a
+  page the game hammers slows it down. A watch may cost 20,000 such exits a second, judged per tenth of a second:
+  over a tenth's share it skips the rest of that tenth, and Cheat Engine's next read (ten a second) turns it on again
+  (the status line counts the times; rev147b -- before, it stopped for a whole second, a tenth of the budget). A few instructions are let through without the single step (PUSHF,
+  IRET, INT n, an interrupt being delivered at that moment): the page then stays open on that vCPU until it moves
+  on, and an access right after could be missed (counted as "unstepped"). Up to 4 watches, 1..4096 bytes each. A
+  watch nobody polls for 10 s (Cheat Engine crashed) stops by itself.
+- **The instruction watch** (turing-hv rev147) makes the instruction's whole 4 KiB code page not executable on the
+  hypervisor's nested page tables. The first instruction run from that page exits to the hypervisor, which then
+  single-steps *every* instruction on the page, one exit each, until execution leaves it; each time it reaches the
+  watched instruction it adds up the address from the registers. What to add is Cheat Engine's own reading of the
+  instruction -- the text inside `[ ]` (as its DBVM version uses; `[RSP]` for RET/POP, `RSP-8` for PUSH/CALL, RSI/RDI
+  for string instructions), evaluated by Cheat Engine's parser on made-up registers to get "register + register *
+  scale + constant", checked on a third set; FS/GS-relative operands add the segment base. An instruction that does
+  not access memory, or an operand that is not of that shape (a vector gather), is refused with the reason. **The cost
+  is every instruction run on that page**, not just the watched one: on cool code it is invisible; on a hot loop it
+  runs into its budget of 20,000 steps a second and skips the rest of each tenth of a second ("over budget" in the
+  dialog's title), so the counts become a sample while the addresses usually all turn up. **Turing-HV > "Instruction
+  watch: watch harder"** (rev147b) raises the budget to 100,000 steps a second -- five times the coverage on hot code,
+  and the game visibly stutters while the watch runs (the title says "watching harder"). It needs the rev147b image
+  and thvbridge.exe; with older ones the watch runs at 20,000 and the title says why. A few instructions cannot be stepped (PUSHF, POPF, SYSCALL, INT,
+  IRET): the page is then left open on that vCPU until its next exit, and a run in between is missed (counted in the
+  title). A kernel instruction is watched in every process. Up to 4 watches in all (data and instruction), 256
+  addresses per instruction.
+- **The capture breakpoint** (turing-hv rev148) uses the same page-trap-and-step as the instruction watch, so the same
+  "every instruction on the page is stepped" cost applies *until* the watched instruction runs -- on a hot page it may
+  stutter briefly before it trips (use "watch harder" if it is very hot). Once it trips, it reads the snapshot (one
+  hit, a few dozen guest-RAM reads, tens of microseconds) and disarms, so the ongoing cost is zero. It does **not**
+  stop the thread (a debugger breakpoint would); the thread runs on after the snapshot. Reads stop at an unmapped page,
+  so a deref of a wild pointer just shows fewer bytes. The snapshot size is yours to set (Turing-HV > "Capture
+  breakpoint: snapshot settings..."): a shorter stack, fewer pointer bytes or no SSE make each hit cheaper. `max_hits`
+  above 1 keeps the last 4 snapshots (a ring) before disarming.
+- **The parking breakpoint** (turing-hv rev149) stops a thread by making its code page non-executable and letting it
+  re-fault in place. **Only that thread stops; the rest of the program keeps running** (unlike a normal debugger, which
+  freezes the whole process). A **stopped thread spins on its CPU core** (it shows as 100% on one core) while it is
+  held -- it makes no progress, but it is not asleep; that is the price of never freezing the core (which would
+  deadlock the machine). It is held **only on its own function's page(s)**: Step into a call that jumps to another page,
+  or any step that leaves the page, lets the thread run free until it hits the breakpoint again (the window says so).
+  **Step over** a call works because the return lands on the same page. Kernel (CPL 0) code is never stopped. Some
+  instructions can't be single-stepped (SYSCALL, IRET, ...), so stepping those lets the thread run to the next hit. No
+  `int3`, debug register or memory change is used, so the game cannot see the breakpoint -- only that the thread took
+  longer. Up to 8 threads can be stopped at one breakpoint at once; the dropdown picks which to control.
+- **The sampled page watch** (images and bridges before rev146, writes only) records the *first* write to the
+  4 KiB page after each re-arm (~10 ms), keeping the hits that landed on the watched bytes. On a busy page the first
+  write is almost never ours (measured: 2 of 90 in 4 s, the rest elsewhere on the page), so a rare writer is easily
+  missed. Its status line always shows how many writes it caught and where they went.
 - **Process names** are EPROCESS's 15 characters unless Windows' own list has the same pid.
 - **The query-only handle is visible** to the target (it can enumerate handles). Turn the option off for none.
 - **Shared code.** If the hypervisor ever accepts writes through read-only PTEs (§5.1), a write to a shared image page
@@ -286,9 +343,17 @@ mapped, copy-on-write) exact instead of inferred (§4), and would answer 5.3 ite
 
 ### 5.5 Debugger: breakpoints, stepping, context
 
-**CE features blocked:** attach debugger, break/step/run, "Break and trace", "Find out what *accesses* this address",
-"Find out what addresses this instruction accesses", conditional breakpoints, changing registers on breakpoint, the
-thread context in the thread list, Ultimap.
+**turing-hv rev146b provides "find out what accesses"** (the data watch, §3), **rev147 "what addresses this
+instruction accesses"** (the instruction watch, §3), **rev148 the capture breakpoint** (a one-shot snapshot that does
+not stop the thread), and **rev149 the parking breakpoint** (§3) -- a thread actually **stops** at the instruction and
+the window gives Step into / Step over / Continue / Run to cursor / Set register. The thread is held by re-faulting its
+code page (no `int3`, no debug register, nothing the game can see), and only that thread stops -- the process is not
+frozen (freezing the whole process would need the guest's cooperation and is not done). **Not covered:** "Break and
+trace" (bulk tracing), conditional breakpoints evaluated in the hypervisor, Ultimap, and the thread-list context view;
+and a step or step-over that leaves the breakpoint's own page runs free until the breakpoint is next hit (see §4).
+
+**CE features blocked:** attach debugger, break/step/run, "Break and trace", conditional breakpoints, changing
+registers on breakpoint, the thread context in the thread list, Ultimap.
 
 **Needed:** the kind of interface DBVM gives Cheat Engine (`dbvm_watch_reads/writes/executes`, its
 `TDBVMDebugInterface`), on NPT:
@@ -302,6 +367,10 @@ Cheat Engine already has the client side for DBVM, so a DBVM-shaped API would pl
 with little new code.
 
 ### 5.6 Watch hits: full context, every hit, per-RIP counts
+
+**Done in turing-hv rev146b** for "find what writes / accesses": the data watch counts every hit per
+instruction in the hypervisor and keeps all general registers, RFLAGS and 8 stack qwords of each instruction's first
+hit. What follows describes the page watch, which remains for older images.
 
 **Observed:** a hit has RIP, RSP, RAX, RCX, RDX, R8, R9, CR3 and 16 stack qwords. The watch is one-shot per page.
 
@@ -381,7 +450,7 @@ New files (all under `Cheat Engine\`):
 | `turinghv\thvbridge\thvbridge.c`, `thvbridge_proto.h` | The bridge and the wire format. |
 | `turinghv\build_thvbridge.ps1` | Builds the bridge and copies the matching `turinghv.dll`. |
 | `turinghv\sdk\` | Vendored `turinghv.h` / `turinghv.lib`. The DLL is always taken from the hypervisor build. |
-| `turinghv\tests\` | End-to-end test (§7) and the bridge IPC smoke test. |
+| `turinghv\tests\` | End-to-end test (§7), the benchmark on a game-shaped target (§7.1: `run_bench.ps1`, `thvbig.c`, `zz_turinghv_bench.lua`), and the bridge IPC smoke test. |
 
 Changes to upstream files (small, each marked "Turing-HV"):
 
@@ -422,6 +491,23 @@ The suite then grew two more checks (the Turing-HV main menu and the address-lis
 **Speed.** A full first scan of a real `explorer.exe` (dword exact value, whole user space) took **312 ms through
 the hypervisor** vs **234 ms through Windows**, with the same 3 results. The hypervisor saw 160 MiB of present pages,
 where Windows reports 207 MiB committed (see §4). Small reads cost about 40 µs each.
+
+### 7.1 The benchmark (2026-11-01)
+
+`Cheat Engine\turinghv\tests\run_bench.ps1` (elevated) runs a game-shaped target (`thvbig.c`: 8000 regions, one busy
+page with a rare writer and a rare reader) and prints, for the memory map, a frozen value, the disassembler and the
+watches, what each cost in bridge requests (`turinghv_bridgeStats`). `THVBENCH_ACCESS=1` also runs the access watch
+(it needs a rev146 image and bridge). What it showed, and what changed:
+
+- A frozen value is written ten times a second, and every write asked for the whole memory map (to refuse writes into
+  shared Windows code): 5 maps in 5 s, 140 ms each for 1 GiB, every other request waiting behind them, the UI's worst
+  pass 156 ms. Now that check asks for the module and then one page: no map, 10 ms of bridge time in 5 s, worst pass
+  16 ms.
+- The map outside a scan stays fresh 20 times as long as it took to build (at least 750 ms), so a slow map (a big game
+  on an image before rev146) is not rebuilt once a second by the memory view. turing-hv rev146 builds it in one walk
+  of the page tables (it used to re-walk them from the bottom for every ~167 regions).
+- The disassembler's repaint is Cheat Engine's own cost: 20 repaints took 1297 ms through the hypervisor and 1578 ms
+  through Windows; its ~140 reads per repaint are ~7 ms of that.
 
 `tests\bridgetest.c` is a smoke test of the bridge protocol that needs no trust: startup, the gate's verdict, rejection
 of malformed requests, CR3 0 refusal, and clean shutdown.
