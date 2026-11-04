@@ -212,6 +212,7 @@ type
 
     physicaladdress: qword;
     DBVMStatusUpdater: TDBVMStatusUpdater;
+    THVTraceStatus: TPanel;   //turing-hv rev150: a TThvTraceStatus (turinghvtrace) while a native trace is armed
 
     currentTracefilename: string;
 
@@ -230,6 +231,9 @@ type
     function getCount: integer;
     function getSelectionCount: integer;
     procedure DBVMTraceDone(sender: TObject);
+    procedure THVTraceStart(address: ptruint; maxcount: integer; over: boolean);
+    procedure THVTraceDone(sender: TObject);
+    procedure THVTraceDrop;
   public
     { Public declarations }
     returnfromignore: boolean;
@@ -255,8 +259,8 @@ uses  LuaByteTable, clipbrd, CEDebugger, debughelper, MemoryBrowserFormUnit, frm
   ProcessHandlerUnit, Globals, Parsers, strutils, CEFuncProc,
   LuaHandler, symbolhandler, byteinterpreter,
   tracerIgnore, LuaForm, lua, lualib,lauxlib, LuaClass,vmxfunctions, DBK32functions,
-  DebuggerInterfaceAPIWrapper, DBVMDebuggerInterface, mainunit2, fontSaveLoadRegistry,
-  Registry, GDBServerDebuggerInterface;
+  DebuggerInterfaceAPIWrapper, turinghvdebugger, DBVMDebuggerInterface, mainunit2, fontSaveLoadRegistry,
+  Registry, GDBServerDebuggerInterface{$ifdef windows}, turinghvtrace, turinghvbridge, turinghvport{$endif};
 
 resourcestring
   rsSearch = 'Search';
@@ -1266,6 +1270,194 @@ begin
   //load the list
 end;
 
+{ turing-hv rev150: Break and Trace on the hypervisor's native trace (turinghvtrace.pas) }
+procedure TfrmTracer.THVTraceDrop;
+begin
+  {$ifdef windows}
+  if THVTraceStatus<>nil then
+  begin
+    thvNativeTraceClear(TThvTraceStatus(THVTraceStatus).id);
+    TThvTraceStatus(THVTraceStatus).OnTraceDone:=nil;
+    freeandnil(THVTraceStatus);
+  end;
+  {$endif}
+end;
+
+procedure TfrmTracer.THVTraceStart(address: ptruint; maxcount: integer; over: boolean);
+{$ifdef windows}
+var
+  id: dword;
+  err: string;
+  p: TThvTraceStatus;
+{$endif}
+begin
+  {$ifdef windows}
+  THVTraceDrop;
+  if maxcount<=0 then maxcount:=THV_TRACE_DEFAULT;
+  if maxcount>THV_TRACE_MAX then maxcount:=THV_TRACE_MAX;
+  if not thvNativeTraceArm(address, maxcount, over, id, err) then
+  begin
+    MessageDlg(err, mtError, [mbok], 0);
+    exit;
+  end;
+  caption:=rsTracer+' - Turing-HV native trace';
+  p:=TThvTraceStatus.createFor(self, id, maxcount);
+  p.parent:=self;
+  p.AnchorSideTop.control:=self;
+  p.AnchorSideTop.side:=asrCenter;
+  p.AnchorSideLeft.Control:=self;
+  p.AnchorSideLeft.Side:=asrLeft;
+  p.AnchorSideRight.Control:=self;
+  p.AnchorSideRight.Side:=asrRight;
+  p.anchors:=[aktop, akright, akLeft];
+  p.OnTraceDone:=THVTraceDone;
+  THVTraceStatus:=p;
+  {$endif}
+end;
+
+procedure TfrmTracer.THVTraceDone(sender: TObject);
+{$ifdef windows}
+var
+  p: TThvTraceStatus;
+  id: dword;
+  info: TThvTraceInfo;
+  recs: TThvTraceRecArray;
+  ok: boolean;
+  err, lost, s, s2: string;
+  i, j: integer;
+  a, target: ptruint;
+  d, dd: TTraceDebugInfo;
+  c: PContext;
+  thisnode, thatnode, y: TTreenode;
+{$endif}
+begin
+  {$ifdef windows}
+  p:=TThvTraceStatus(THVTraceStatus);
+  if p=nil then exit;
+  THVTraceStatus:=nil;
+  id:=p.id;
+  lost:=p.lastError;
+  p.OnTraceDone:=nil;
+  p.visible:=false;
+  application.ReleaseComponent(p);   //freed after its own event (the timer / the button) has returned
+
+  //the records first (a running trace keeps them until it is cleared), then end it and free its watch
+  ok:=thvNativeTraceFetch(id, info, recs, err);
+  thvNativeTraceClear(id);
+  if not ok then
+  begin
+    if lost<>'' then err:=lost;
+    MessageDlg(err, mtError, [mbok], 0);
+    exit;
+  end;
+
+  if contexthandler=nil then contexthandler:=getBestContextHandler;
+  if da=nil then
+  begin
+    da:=tdisassembler.Create;
+    da.showsymbols:=symhandler.showsymbols;
+    da.showmodules:=symhandler.showmodules;
+    da.showsections:=symhandler.showsections;
+  end;
+
+  lvTracer.Items.BeginUpdate;
+  try
+    for i:=0 to high(recs) do
+    begin
+      a:=recs[i].rip;
+      s:=da.disassemble(a,s2);
+      j:=posex('-',s);
+      j:=posex('-',s,j+1);
+      s:=copy(s,j+2,length(s));
+
+      d:=TTraceDebugInfo.Create;
+      d.cr3:=0;    //read through the opened (turing-hv) process
+      d.instructionsize:=a-recs[i].rip;
+      d.context:=AllocMem(max(contexthandler.ContextSize, sizeof(TContext)));
+      d.contexthandler:=contexthandler;
+      c:=PContext(d.context);
+      {$ifdef cpu64}
+      c^.Rip:=recs[i].rip;
+      c^.Rsp:=recs[i].rsp;
+      c^.EFlags:=dword(recs[i].rflags);
+      c^.Rax:=recs[i].gpr[0];
+      c^.Rcx:=recs[i].gpr[1];
+      c^.Rdx:=recs[i].gpr[2];
+      c^.Rbx:=recs[i].gpr[3];
+      c^.Rbp:=recs[i].gpr[5];
+      c^.Rsi:=recs[i].gpr[6];
+      c^.Rdi:=recs[i].gpr[7];
+      c^.R8:=recs[i].gpr[8];
+      c^.R9:=recs[i].gpr[9];
+      c^.R10:=recs[i].gpr[10];
+      c^.R11:=recs[i].gpr[11];
+      c^.R12:=recs[i].gpr[12];
+      c^.R13:=recs[i].gpr[13];
+      c^.R14:=recs[i].gpr[14];
+      c^.R15:=recs[i].gpr[15];
+      c^.P2Home:=info.teb;   //as DBVM's trace does: spare fields for the thread's GS base and CR3
+      c^.P3Home:=info.cr3;
+      {$endif}
+      d.instruction:=s;
+      d.referencedAddress:=0;
+      d.isfloat:=false;
+      d.bytes:=nil;
+      d.bytesize:=0;
+
+      s:=symhandler.getNameFromAddress(recs[i].rip)+' - '+s;
+
+      if currentAppendage<>nil then
+        thisnode:=lvTracer.Items.AddChildObject(currentAppendage,s,d)
+      else
+        thisnode:=lvTracer.Items.AddObject(nil,s,d);
+
+      if (not stepover) and da.LastDisassembleData.iscall then
+        currentAppendage:=thisnode
+      else
+      if da.LastDisassembleData.isret then
+      begin
+        if currentAppendage<>nil then
+        begin
+          //back to the call this returns to: the one whose next instruction is the next record
+          target:=0;
+          if i<high(recs) then target:=recs[i+1].rip;
+          y:=currentAppendage;
+          while (y<>nil) and (target<>0) do
+          begin
+            dd:=TTraceDebugInfo(y.Data);
+            if (dd<>nil) and (PContext(dd.context)^.{$ifdef cpu64}Rip{$else}Eip{$endif}+ptruint(dd.instructionsize)=target) then break;
+            y:=y.Parent;
+          end;
+          if y<>nil then
+            currentAppendage:=y.Parent
+          else
+            currentAppendage:=currentAppendage.Parent;
+        end
+        else
+        begin
+          //returned out of where the trace began: what came before becomes a child of an unnamed top node
+          thisnode:=lvTracer.items.AddFirst(nil,'');
+          thatnode:=thisnode.GetNextSibling;
+          while thatnode<>nil do
+          begin
+            thatnode.MoveTo(thisnode, naAddChild);
+            thatnode:=thisnode.GetNextSibling;
+          end;
+        end;
+      end;
+    end;
+  finally
+    lvTracer.Items.EndUpdate;
+  end;
+
+  s:=thvNativeTraceSummary(info, length(recs));
+  caption:=rsTracer+' - Turing-HV native trace: '+s;
+  TuringHV_Log('Turing-HV native trace '+inttostr(id)+': '+s);
+  if length(recs)=0 then
+    MessageDlg('Turing-HV native trace: '+s, mtInformation, [mbok], 0);
+  {$endif}
+end;
+
 procedure TfrmTracer.miNewTraceClick(Sender: TObject);
 var tcount: integer;
     startcondition,stopcondition: string;
@@ -1342,6 +1534,9 @@ begin
 
 
       {$ifdef windows}
+      if cbTHVNativeTrace.checked then
+        self.THVTraceStart(fromaddress, tcount, stepover)  //turing-hv rev150: the hypervisor's native trace
+      else
       if cbDBVMBreakAndTrace.checked then
       begin
         if loaddbvmifneeded(rsDBVMBreakAndTraceNeedsDBVM)=false then exit;
@@ -1445,6 +1640,8 @@ begin
 
         if CurrentDebuggerInterface is TGDBServerDebuggerInterface then
           breakpointmethod:=bpmGDB;
+        if CurrentDebuggerInterface is TTuringHVDebugInterface then
+          breakpointmethod:=bpmTuringHV;
 
         if fDataTrace then
         begin
@@ -1986,6 +2183,7 @@ end;
 procedure TfrmTracer.FormClose(Sender: TObject; var Action: TCloseAction);
 var i: integer;
 begin
+  THVTraceDrop;
 
   if debuggerthread<>nil then
     debuggerthread.stopBreakAndTrace(self);

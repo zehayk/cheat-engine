@@ -12,7 +12,7 @@
 
         powershell -ExecutionPolicy Bypass -File "Cheat Engine\turinghv\tests\run_tests.ps1"
 #>
-param([string]$Work = (Join-Path $env:TEMP 'thvtest'))
+param([string]$Work = (Join-Path $env:TEMP 'thvtest'), [string]$Exe = 'cheatengine-x86_64.exe')
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $bin = (Resolve-Path (Join-Path $here '..\..\bin')).Path
@@ -31,10 +31,10 @@ if ((Test-Path $t64exe) -and (Get-Item $t64exe).LastWriteTime -lt $src.LastWrite
 if ((Test-Path $t32exe) -and (Get-Item $t32exe).LastWriteTime -lt $src.LastWriteTime) { Remove-Item $t32exe -Force }
 if (-not (Test-Path $t64exe)) {
     Import-VsEnv "$vsroot\vcvars64.bat"
-    & clang -O1 -D_CRT_SECURE_NO_WARNINGS (Join-Path $here 'thvtarget.c') -o $t64exe
+    & clang -O1 -D_CRT_SECURE_NO_WARNINGS (Join-Path $here 'thvtarget.c') '-Wl,/INCREMENTAL:NO' -o $t64exe   # no ILT: &bump is bump itself, not a jmp thunk
 }
 if (-not (Test-Path $t32exe)) {
-    cmd /c "`"$vsroot\vcvars32.bat`" >nul 2>&1 && clang -m32 -O1 -D_CRT_SECURE_NO_WARNINGS `"$(Join-Path $here 'thvtarget.c')`" -o `"$t32exe`""
+    cmd /c "`"$vsroot\vcvars32.bat`" >nul 2>&1 && clang -m32 -O1 -D_CRT_SECURE_NO_WARNINGS `"$(Join-Path $here 'thvtarget.c')`" -Wl,/INCREMENTAL:NO -o `"$t32exe`""
 }
 
 $run = Join-Path $Work 'run'
@@ -51,7 +51,7 @@ $driver = Join-Path $bin 'autorun\zz_turinghv_test.lua'
 Copy-Item (Join-Path $here 'zz_turinghv_test.lua') $driver -Force
 try {
     $env:THVTEST_DIR = $run
-    $ce = Start-Process (Join-Path $bin 'cheatengine-x86_64.exe') -PassThru
+    $ce = Start-Process (Join-Path $bin $Exe) -PassThru
     if (-not $ce.WaitForExit(300000)) {
         Write-Warning 'Cheat Engine did not finish in 5 minutes; its windows:'
         & (Join-Path $here 'winlist.ps1') -ProcessId $ce.Id

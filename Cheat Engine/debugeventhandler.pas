@@ -197,7 +197,7 @@ uses foundcodeunit, DebugHelper, MemoryBrowserFormUnit, frmThreadlistunit,
      networkInterface, networkInterfaceApi, ProcessHandlerUnit, globals,
      UnexpectedExceptionsHelper, frmcodefilterunit, frmBranchMapperUnit, LuaHandler,
      LazLogger, Dialogs, vmxfunctions, DebuggerInterface, DBVMDebuggerInterface,
-     formChangedAddresses, iptnative, commonTypeDefs, GDBServerDebuggerInterface;
+     formChangedAddresses, iptnative, commonTypeDefs, GDBServerDebuggerInterface, turinghvdebugger;
 
 resourcestring
   rsDebugHandleAccessViolationDebugEventNow = 'Debug HandleAccessViolationDebugEvent now';
@@ -961,6 +961,13 @@ begin
 
           nexteip:=contexthandler.InstructionPointerRegister^.getValue(context);
           d.disassemble(nexteip, t);
+          if (d.LastDisassembleData.iscall or d.LastDisassembleData.isrep) and (CurrentDebuggerInterface is TTuringHVDebugInterface) then
+          begin
+            //Turing-HV: the hypervisor runs the held thread to the next instruction (step over / run to)
+            TTuringHVDebugInterface(CurrentDebuggerInterface).stepOverTarget:=nexteip;
+            singlestepping:=true;
+          end
+          else
           if d.LastDisassembleData.iscall or d.LastDisassembleData.isrep then
           begin
             //set an execute breakpoint for this thread only at the next instruction and run till there
@@ -1943,6 +1950,47 @@ begin
         else
         begin
           dwContinueStatus:=DBG_CONTINUE; //unknown bp (shouldn't happen), just continue
+          exit(true);
+        end;
+      end;
+
+      if singlestepping then
+        dwContinueStatus:=DBG_CONTINUE_SINGLESTEP
+      else
+        dwContinueStatus:=DBG_CONTINUE;
+
+      setContext;
+    end;
+
+    EXCEPTION_TURINGHV_BREAKPOINT:
+    begin
+      //Turing-HV: a thread held at a parking breakpoint (or a capture's snapshot), or a step that landed (flags -1)
+      outputdebugstring('EXCEPTION_TURINGHV_BREAKPOINT');
+      if debugEvent.Exception.ExceptionRecord.ExceptionFlags=dword(-1) then
+        result:=singleStep(dwContinueStatus)
+      else
+      begin
+        found:=false;
+        debuggercs.enter;
+        for i:=0 to breakpointList.count - 1 do
+        begin
+          bp:=PBreakpoint(breakpointlist.Items[i]);
+          if bp^.active and
+             (bp^.breakpointMethod=bpmTuringHV) and
+             (bp^.debuggerinterfacewatchid=integer(debugEvent.Exception.ExceptionRecord.ExceptionFlags))
+          then
+          begin
+            found:=true;
+            break;
+          end;
+        end;
+        debuggercs.leave;
+
+        if found then
+          result:=DispatchBreakpoint(bp^.address, -2, dwContinueStatus)
+        else
+        begin
+          dwContinueStatus:=DBG_CONTINUE; //a breakpoint already removed: let the thread go
           exit(true);
         end;
       end;

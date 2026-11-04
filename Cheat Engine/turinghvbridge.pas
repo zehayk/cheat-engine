@@ -139,6 +139,9 @@ const
   THVB_CMD_DWATCH_ARM_BREAK   = 40; //turing-hv rev149 (SDK 1.12): the parking breakpoint (stop / step a thread)
   THVB_CMD_DWATCH_BK_READ     = 41;
   THVB_CMD_DWATCH_BK_CMD      = 42;
+  THVB_CMD_DWATCH_ARM_TRACE   = 43; //turing-hv rev150 (SDK 1.13): the native trace (the thread never stops)
+  THVB_CMD_DWATCH_TR_READ     = 44;
+  THVB_TRACE_INFO_OFF         = 128; //TR_READ: where TThvTraceInfo sits in the slot's data
 
   THV_DWATCH_WRITE  = 1;
   THV_DWATCH_ACCESS = 3;
@@ -171,6 +174,24 @@ const
   THV_BKS_HELD       = 0;   //stopped at the breakpoint
   THV_BKS_STEPPING   = 1;   //a step / continue is in flight
   THV_BKS_RANOUT     = 2;   //ran off the watched page; will re-park at the next hit
+  //rev150: the native trace (DWatchArmTrace / DWatchTraceRead): the first thread to reach the instruction is
+  //followed instruction by instruction, on any page, and each instruction's registers recorded
+  THV_TRACE_MAX      = 2048;
+  THV_TRACE_DEFAULT  = 1000;
+  THV_TRF_OVER       = 1;   //record only the traced function's own instructions (a callee runs unrecorded)
+  THV_TRS_ARMED      = 1;   //waiting for a thread to reach the instruction
+  THV_TRS_RUNNING    = 2;
+  THV_TRS_DONE       = 3;
+  THV_TRE_COUNT      = 1;   //the records asked for are taken
+  THV_TRE_NOSTEP     = 2;   //the next instruction can't be stepped unseen (PUSHF/POPF/IRET/SYSCALL/INT n)
+  THV_TRE_EVENT      = 3;   //an interrupt was due for the thread
+  THV_TRE_EXCEPTION  = 4;
+  THV_TRE_GUEST_TF   = 5;   //the thread single-steps itself
+  THV_TRE_LEFT       = 6;   //address space / privilege changed
+  THV_TRE_L1         = 7;   //Hyper-V kept the vCPU too long
+  THV_TRE_EMULATED   = 8;
+  THV_TRE_CLEARED    = 9;
+  THV_TRE_OTHER      = 10;
 
 type
   TThvConnectionInfo = record
@@ -443,6 +464,20 @@ type
     value: qword;         //SETREG / SETRIP value, or RUNTO target
   end;
 
+  { rev150: one traced instruction (thv_trace_rec): its registers before it ran }
+  TThvTraceRec = record
+    rip, rsp, rflags: qword;
+    gpr: array[0..15] of qword;   //RAX RCX RDX RBX RSP RBP RSI RDI R8..R15
+  end;
+  PThvTraceRec = ^TThvTraceRec;
+  TThvTraceRecArray = array of TThvTraceRec;
+  { rev150: the trace's state (thv_trace_info) }
+  TThvTraceInfo = record
+    state, reason, count, max, flags, pauses, vcpu, pad: dword;   //state THV_TRS_*, reason THV_TRE_*
+    steps, teb, pid, tid, cr3, start_tsc, end_tsc, tsc_hz: qword;
+  end;
+  PThvTraceInfo = ^TThvTraceInfo;
+
   TThvSlatPage = record
     va, pa: qword;
     flags, reserved: dword;
@@ -624,6 +659,11 @@ type
     function DWatchArmBreak(cr3, address: qword; length: dword; const op: TThvDWatchOperand; out id: dword; out st: TThvDWatchStatus): dword;
     function DWatchBreakRead(id, index: dword; out st: TThvDWatchStatus; out rec: TThvCaptureRec): dword;
     function DWatchBreakCmd(id: dword; const c: TThvBreakCmd; out st: TThvDWatchStatus): dword;
+    { turing-hv rev150: the native trace -- follow the first thread to reach `address`; it never stops.
+      maxrecords 0 = THV_TRACE_DEFAULT; flags THV_TRF_OVER or 0.  One trace at a time. }
+    function DWatchArmTrace(cr3, address: qword; length, maxrecords, flags: dword; out id: dword; out st: TThvDWatchStatus): dword;
+    { records [first, first+length(recs)); st.entries = records taken so far }
+    function DWatchTraceRead(id, first: dword; max: integer; out st: TThvDWatchStatus; out info: TThvTraceInfo; out recs: TThvTraceRecArray): dword;
     function SlatQuery(cr3, address: qword; pages: integer; out list: array of TThvSlatPage; out slat: dword; out got: integer): dword;
     function LogRead(from: qword; max: dword; out text: ansistring; out info: TThvLogInfo): dword;
     function TrustQuery(out list: TThvTrustList): dword;
@@ -639,6 +679,7 @@ type
 
 function thvStatusString(status: dword): string;
 function thvCr3MethodName(m: dword): string;
+function thvTraceEndText(reason: dword): string;   //rev150: why a native trace ended (THV_TRE_*)
 
 const
   THVB_STAT_CMDS = 64;
@@ -699,13 +740,34 @@ begin
 end;
 
 function thvCmdName(cmd: dword): string;
-const names: array[1..36] of string = ('ping','connection_info','get_access','reopen','status','intro_diag',
+const names: array[1..44] of string = ('ping','connection_info','get_access','reopen','status','intro_diag',
   'process_info','read','write','read_phys','read_scatter','write_scatter','read_phys_scatter','enum_processes',
   'enum_kmodules','enum_umodules','enum_threads','enum_memory','phys_ranges','cr3_query','cr3_watch','cr3_scan_step',
   'xwatch_arm','xwatch_arm_deref','xwatch_read','xwatch_clear','wwatch_arm','wwatch_read','wwatch_clear',
-  'slat_query','log_read','trust_query','shutdown','dwatch_arm','dwatch_read','dwatch_clear');
+  'slat_query','log_read','trust_query','shutdown','dwatch_arm','dwatch_read','dwatch_clear','dwatch_arm_exec',
+  'dwatch_arm_capture','dwatch_cap_read','dwatch_arm_break','dwatch_bk_read','dwatch_bk_cmd','dwatch_arm_trace',
+  'dwatch_tr_read');
 begin
-  if (cmd>=1) and (cmd<=36) then result:=names[cmd] else result:='cmd'+inttostr(cmd);
+  if (cmd>=1) and (cmd<=44) then result:=names[cmd] else result:='cmd'+inttostr(cmd);
+end;
+
+function thvTraceEndText(reason: dword): string;
+begin
+  case reason of
+    THV_TRE_COUNT:     result:='the records asked for are taken';
+    THV_TRE_NOSTEP:    result:='the next instruction can''t be stepped unseen (PUSHF / POPF / IRET / SYSCALL / INT n)';
+    THV_TRE_EVENT:     result:='an interrupt was due for the thread';
+    THV_TRE_EXCEPTION: result:='the instruction raised an exception';
+    THV_TRE_GUEST_TF:  result:='the thread single-steps itself (its own trap flag)';
+    THV_TRE_LEFT:      result:='the thread left the process or user mode';
+    THV_TRE_L1:        result:='Hyper-V kept the vCPU too long';
+    THV_TRE_EMULATED:  result:='an instruction was emulated by Hyper-V';
+    THV_TRE_CLEARED:   result:='cleared';
+    THV_TRE_OTHER:     result:='stopped (other)';
+    0:                 result:='running';
+  else
+    result:='reason '+inttostr(reason);
+  end;
 end;
 
 function thvCr3MethodName(m: dword): string;
@@ -754,6 +816,8 @@ begin
   need(sizeof(TThvCaptureSeg),16,'thv_capture_seg');
   need(sizeof(TThvCaptureRec),3688,'thv_capture_rec');
   need(sizeof(TThvBreakCmd),24,'thv_break_cmd');
+  need(sizeof(TThvTraceRec),152,'thv_trace_rec');
+  need(sizeof(TThvTraceInfo),96,'thv_trace_info');
   need(sizeof(TThvSlatPage),24,'thv_slat_page');
   need(sizeof(TThvLogInfo),32,'thv_log_info');
   need(sizeof(TThvTrustEntry),292,'thv_trust_entry');
@@ -1839,6 +1903,50 @@ begin
       st:=PThvDWatchStatus(slotData(i))^;
       if (result=THV_OK) and (index<st.count) and (fData>=THVB_ARRAY_OFF+sizeof(rec)) then
         move((slotData(i)+THVB_ARRAY_OFF)^, rec, sizeof(rec));
+    end;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.DWatchArmTrace(cr3, address: qword; length, maxrecords, flags: dword; out id: dword; out st: TThvDWatchStatus): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  id:=0;
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    result:=Exec(i, THVB_CMD_DWATCH_ARM_TRACE, [cr3, address, length, maxrecords, flags]);
+    if completed(i) then
+    begin
+      st:=PThvDWatchStatus(slotData(i))^;
+      if result=THV_OK then id:=dword(rv(i,0));
+    end;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.DWatchTraceRead(id, first: dword; max: integer; out st: TThvDWatchStatus; out info: TThvTraceInfo; out recs: TThvTraceRecArray): dword;
+var i, n: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  zeromemory(@info,sizeof(info));
+  setlength(recs,0);
+  if max<0 then max:=0;
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    result:=Exec(i, THVB_CMD_DWATCH_TR_READ, [id, first, max]);
+    if completed(i) then
+    begin
+      st:=PThvDWatchStatus(slotData(i))^;
+      info:=PThvTraceInfo(slotData(i)+THVB_TRACE_INFO_OFF)^;
+      if result=THV_OK then
+      begin
+        n:=integer(min(min(rv(i,0), qword(max)), qword((fData-THVB_ARRAY_OFF) div sizeof(TThvTraceRec))));
+        setlength(recs,n);
+        if n>0 then move((slotData(i)+THVB_ARRAY_OFF)^, recs[0], n*sizeof(TThvTraceRec));
+      end;
     end;
   finally
     Release(i);

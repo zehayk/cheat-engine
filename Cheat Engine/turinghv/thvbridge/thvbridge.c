@@ -33,6 +33,9 @@ _Static_assert(offsetof(thvb_shared, access) == 1088, "layout");
 _Static_assert(sizeof(thv_access) == 288, "layout");
 _Static_assert(sizeof(thv_dwatch_status) == 80 && sizeof(thv_dwatch_entry) == 264, "layout (turinghvbridge.pas)");
 _Static_assert(sizeof(thv_dwatch_operand) == 32, "layout (turinghvbridge.pas TThvDWatchOperand)");
+_Static_assert(sizeof(thv_trace_rec) == 152 && sizeof(thv_trace_info) == 96, "layout (turinghvbridge.pas TThvTrace*)");
+_Static_assert(THVB_TRACE_INFO_OFF >= sizeof(thv_dwatch_status) &&
+               THVB_TRACE_INFO_OFF + sizeof(thv_trace_info) <= THVB_ARRAY_OFF, "layout (TR_READ)");
 _Static_assert(offsetof(thvb_shared, version) == 1376, "layout");
 _Static_assert(sizeof(thvb_shared) <= THVB_PAGE, "header page");
 _Static_assert(offsetof(thvb_slot, arg) == 24, "layout");
@@ -479,6 +482,51 @@ static void dispatch(worker *w, const thvb_slot *q, thvb_slot *r, uint8_t *d, in
         memset(d, 0, sizeof(thv_dwatch_status));
         r->status = thv_dwatch_break_cmd((uint32_t)q->arg[0], &bc, (thv_dwatch_status *)d);
         r->out_len = sizeof(thv_dwatch_status);
+        break;
+    }
+    /* turing-hv rev150: the native trace */
+    case THVB_CMD_DWATCH_ARM_TRACE: {
+        if (!foreign_cr3(q->arg[0]) || !q->arg[2] || q->arg[2] > 15u || q->arg[3] > THV_TRACE_MAX ||
+            (q->arg[4] & ~(uint64_t)THV_TRF_OVER)) {
+            r->status = THV_E_BAD_ARGUMENT;
+            break;
+        }
+        uint32_t id = 0;
+        memset(d, 0, sizeof(thv_dwatch_status));
+        r->status = thv_dwatch_arm_trace(q->arg[0], q->arg[1], (uint32_t)q->arg[2], (uint32_t)q->arg[3],
+                                         (uint32_t)q->arg[4], &id, (thv_dwatch_status *)d);
+        r->ret[0] = id;
+        r->out_len = sizeof(thv_dwatch_status);
+        break;
+    }
+    case THVB_CMD_DWATCH_TR_READ: {
+        /* One hypervisor answer carries ~25 records: loop here so Cheat Engine asks once for many. */
+        if (q->arg[1] > THV_TRACE_MAX || THVB_ARRAY_OFF + sizeof(thv_trace_rec) > cap) {
+            r->status = THV_E_BAD_ARGUMENT;
+            break;
+        }
+        uint32_t want = min_u32(q->arg[2], (cap - THVB_ARRAY_OFF) / sizeof(thv_trace_rec));
+        if (want > THV_TRACE_MAX) want = THV_TRACE_MAX;
+        const uint32_t id = (uint32_t)q->arg[0], first = (uint32_t)q->arg[1];
+        thv_dwatch_status *s = (thv_dwatch_status *)d;
+        thv_trace_info *ti = (thv_trace_info *)(d + THVB_TRACE_INFO_OFF);
+        thv_trace_rec *rec = (thv_trace_rec *)(d + THVB_ARRAY_OFF);
+        memset(d, 0, THVB_ARRAY_OFF);
+        uint32_t got = 0, n = 0;
+        r->status = thv_dwatch_trace_read(id, first, ti, rec, want, &n, s);
+        got = r->status == THV_OK ? n : 0u;
+        while (r->status == THV_OK && n && got < want && (uint64_t)first + got < s->entries) {
+            thv_dwatch_status s2;
+            thv_trace_info t2;
+            memset(&s2, 0, sizeof s2);
+            n = 0;
+            if (thv_dwatch_trace_read(id, first + got, &t2, rec + got, want - got, &n, &s2) != THV_OK) break;
+            memcpy(s, &s2, sizeof s2);      /* the newest state, only from an answer that worked */
+            memcpy(ti, &t2, sizeof t2);
+            got += n;
+        }
+        r->ret[0] = got;
+        r->out_len = THVB_ARRAY_OFF + got * (uint32_t)sizeof(thv_trace_rec);
         break;
     }
 

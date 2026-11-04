@@ -1091,6 +1091,7 @@ type
     property isProtected: boolean read fIsProtected write setIsProtected;
 
     property ActivePreviousResultColumn: integer read fActivePreviousResultColumn write setActivePreviousResultColumn;
+    function FoundListSelection(out address: ptruint; out size: integer): boolean; //Turing-HV menu (turinghvui.pas)
   published
     property Progressbar1: TProgressBar read Progressbar write ProgressBar;
     property About1: TMenuItem read miAbout write miAbout;
@@ -10082,6 +10083,18 @@ begin
     DebuggerThread.FindWhatWrites(address, memscan.Getbinarysize div 8);
   end;
 
+end;
+
+//2026-11-04: the selected scan result and its size, as miFlFindWhat*Click take them (the Turing-HV items beside them)
+function TMainForm.FoundListSelection(out address: ptruint; out size: integer): boolean;
+begin
+  address:=0;
+  size:=0;
+  result:=(foundlist3.Selected<>nil) and (foundlist<>nil) and (memscan<>nil);
+  if not result then exit;
+  address:=foundlist.GetAddress(foundlist3.Selected.Index);
+  size:=memscan.Getbinarysize div 8;
+  if size<=0 then size:=1;
 end;
 
 procedure TMainForm.miSaveFileClick(Sender: TObject);

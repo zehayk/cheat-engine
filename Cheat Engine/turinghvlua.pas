@@ -25,6 +25,15 @@ unit turinghvlua;
     turinghv_captureHere(address) -> ok, why   arms a capture breakpoint: snapshot every value at the instruction, then disarm
     turinghv_setBreakpoint(address) -> ok, why  arms a parking breakpoint: a thread stops here; step / continue it in the window
                                              (rev147: "find out what addresses this instruction accesses")
+    turinghv_traceStart(address [, max [, stepover]]) -> id, or nil, why   (rev150) the native trace: the first thread
+                                             to reach the instruction is followed instruction by instruction, never
+                                             stopped; max 1..2048 (default 1000); stepover: callees run unrecorded
+    turinghv_traceRead(id [, records])       -> {state, reason, why, count, max, steps, pauses, tid, pid, teb, vcpu, us,
+                                                 records = {{rip, rsp, rflags, rax, rcx, rdx, rbx, rbp, rsi, rdi,
+                                                 r8..r15}, ...}}, or nil, why   (records=false: the state only)
+    turinghv_traceClear(id)                  ends the trace and frees its watch (read the records first)
+    turinghv_threadContext(tid)              -> {token, ok, rip, rsp, rbp, rflags, rbx, rsi, rdi}: the thread opened
+                                                and read as the thread list does (a token, the kernel trap frame)
     turinghv_bridgeStats([reset])            the bridge's requests per command, and their microseconds
     turinghv_getLog()                        -> Cheat Engine's Turing-HV log
 *)
@@ -45,8 +54,8 @@ implementation
 {$ifdef windows}
 
 uses
-  windows, math, luahandler, LuaByteTable, turinghvport, turinghvbridge, turinghvwatch, turinghvui,
-  ProcessHandlerUnit;
+  windows, math, luahandler, LuaByteTable, turinghvport, turinghvbridge, turinghvwatch, turinghvui, turinghvdebugger,
+  turinghvstack, turinghvtrace, symbolhandler, NewKernelHandler, ProcessHandlerUnit;
 
 type
   { Lua may run in a worker thread (createThread); turning the backend on/off, the watch dialog and the status
@@ -423,6 +432,102 @@ begin
   result:=2;
 end;
 
+// rev150: the native trace
+function l_traceStart(L: Plua_State): integer; cdecl;
+var
+  id: dword;
+  err: string;
+  mx: integer;
+  over: boolean;
+begin
+  if not needActive(L) then exit(2);
+  mx:=0;
+  if lua_gettop(L)>=2 then mx:=max(0, integer(lua_tointeger(L,2)));
+  over:=(lua_gettop(L)>=3) and lua_toboolean(L,3);
+  if thvNativeTraceArm(qword(lua_tointeger(L,1)), mx, over, id, err) then
+  begin
+    lua_pushinteger(L, id);
+    lua_pushnil(L);
+  end
+  else
+  begin
+    lua_pushnil(L);
+    lua_pushstring(L, pchar(err));
+  end;
+  result:=2;
+end;
+
+function l_traceRead(L: Plua_State): integer; cdecl;
+const names: array[0..15] of string = ('rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi','r8','r9','r10','r11','r12',
+  'r13','r14','r15');
+var
+  id, r: dword;
+  info: TThvTraceInfo;
+  st: TThvDWatchStatus;
+  recs: TThvTraceRecArray;
+  err: string;
+  withRecs, ok: boolean;
+  i, k: integer;
+begin
+  if not needActive(L) then exit(2);
+  id:=dword(lua_tointeger(L,1));
+  withRecs:=(lua_gettop(L)<2) or lua_toboolean(L,2);
+  setlength(recs,0);
+  if withRecs then
+    ok:=thvNativeTraceFetch(id, info, recs, err)
+  else
+  begin
+    r:=TuringHV_Bridge.DWatchTraceRead(id, 0, 0, st, info, recs);
+    ok:=r=THV_OK;
+    if not ok then err:='reading the trace failed: '+thvStatusString(r);
+  end;
+  if not ok then
+  begin
+    lua_pushnil(L);
+    lua_pushstring(L, pchar(err));
+    exit(2);
+  end;
+  lua_newtable(L);
+  setfield_i(L, 'state', info.state);
+  setfield_i(L, 'reason', info.reason);
+  setfield_s(L, 'why', thvTraceEndText(info.reason));
+  setfield_i(L, 'count', info.count);
+  setfield_i(L, 'max', info.max);
+  setfield_i(L, 'steps', info.steps);
+  setfield_i(L, 'pauses', info.pauses);
+  setfield_i(L, 'tid', info.tid);
+  setfield_i(L, 'pid', info.pid);
+  setfield_i(L, 'teb', info.teb);
+  setfield_i(L, 'vcpu', info.vcpu);
+  setfield_i(L, 'flags', info.flags);
+  if (info.tsc_hz<>0) and (info.end_tsc>info.start_tsc) then
+    setfield_i(L, 'us', ((info.end_tsc-info.start_tsc)*1000000) div info.tsc_hz)
+  else
+    setfield_i(L, 'us', 0);
+  if withRecs then
+  begin
+    lua_pushstring(L, 'records');
+    lua_newtable(L);
+    for i:=0 to high(recs) do
+    begin
+      lua_pushinteger(L, i+1);
+      lua_newtable(L);
+      setfield_i(L, 'rip', recs[i].rip);
+      setfield_i(L, 'rflags', recs[i].rflags);
+      for k:=0 to 15 do setfield_i(L, names[k], recs[i].gpr[k]);
+      lua_settable(L, -3);
+    end;
+    lua_settable(L, -3);
+  end;
+  result:=1;
+end;
+
+function l_traceClear(L: Plua_State): integer; cdecl;
+begin
+  if TuringHV_Active then thvNativeTraceClear(dword(lua_tointeger(L,1)));
+  result:=0;
+end;
+
 function l_getLog(L: Plua_State): integer; cdecl;
 begin
   lua_pushstring(L, pchar(TuringHV_LogText));
@@ -463,7 +568,78 @@ begin
   if sametext(name,'SharedCodeWrites') then exit(@thvOptSharedCodeWrites);
   if sametext(name,'SlowCR3') then exit(@thvOptSlowCr3);
   if sametext(name,'WatchHarder') then exit(@thvOptWatchHarder);
+  if sametext(name,'Debugger') then exit(@thvDbgUseHV);              //the Turing-HV debugger for HV targets (session)
+  if sametext(name,'DebuggerSnapshot') then exit(@thvDbgSnapshot);   //...its breakpoints snapshot, never stop
   result:=nil;
+end;
+
+(* turinghv_unwind(rip, rsp [, rbp]) -> an array of frames (rip, rsp, call = bool, how, name): the call stack decoded
+   with the modules' unwind tables (turinghvstack.pas), read through Cheat Engine's ReadProcessMemory (the hypervisor
+   for a Turing-HV target). Frame 1 is where rip is. *)
+type
+  TLuaLiveReader = class
+    function Read(address: qword; buf: pointer; size: integer): integer;
+  end;
+
+function TLuaLiveReader.Read(address: qword; buf: pointer; size: integer): integer;
+var br: ptruint;
+begin
+  br:=0;
+  if ReadProcessMemory(processhandler.processhandle, pointer(ptruint(address)), buf, size, br) then result:=integer(br) else result:=0;
+end;
+
+function l_unwind(L: Plua_State): integer; cdecl;
+var
+  gpr: array[0..15] of qword;
+  fr: TThvFrames;
+  rd: TLuaLiveReader;
+  i: integer;
+  found: boolean;
+begin
+  fillchar(gpr, sizeof(gpr), 0);
+  gpr[4]:=qword(lua_tointeger(L, 2));
+  if lua_gettop(L)>=3 then gpr[5]:=qword(lua_tointeger(L, 3));
+  rd:=TLuaLiveReader.Create;
+  try
+    fr:=ThvUnwind(qword(lua_tointeger(L, 1)), gpr[4], gpr, rd.Read, 32);
+  finally
+    rd.Free;
+  end;
+  lua_newtable(L);
+  for i:=0 to high(fr) do
+  begin
+    lua_pushinteger(L, i+1);
+    lua_newtable(L);
+    lua_pushstring(L, 'rip'); lua_pushinteger(L, int64(fr[i].rip)); lua_settable(L, -3);
+    lua_pushstring(L, 'rsp'); lua_pushinteger(L, int64(fr[i].rsp)); lua_settable(L, -3);
+    lua_pushstring(L, 'call'); lua_pushboolean(L, fr[i].callsite); lua_settable(L, -3);
+    lua_pushstring(L, 'how'); lua_pushstring(L, pchar(fr[i].how)); lua_settable(L, -3);
+    if fr[i].stop<>'' then begin lua_pushstring(L, 'stop'); lua_pushstring(L, pchar(fr[i].stop)); lua_settable(L, -3); end;
+    lua_pushstring(L, 'name'); lua_pushstring(L, pchar(symhandler.getNameFromAddress(fr[i].rip, found, 16))); lua_settable(L, -3);
+    lua_settable(L, -3);
+  end;
+  result:=1;
+end;
+
+//2026-11-04: turinghv_threadContext(tid) -> table (token, ok, rip, rsp, rbp, rflags, rbx, rsi, rdi): OpenThread +
+//GetThreadContext + CloseHandle exactly as Cheat Engine's thread list calls them (turinghvport's token path).
+function l_threadContext(L: Plua_State): integer; cdecl;
+var
+  c: TContext;
+  token, ok: boolean;
+begin
+  ok:=TuringHV_ThreadContext(dword(lua_tointeger(L, 1)), c, token);
+  lua_newtable(L);
+  lua_pushstring(L, 'token'); lua_pushboolean(L, token); lua_settable(L, -3);
+  lua_pushstring(L, 'ok'); lua_pushboolean(L, ok); lua_settable(L, -3);
+  lua_pushstring(L, 'rip'); lua_pushinteger(L, int64(c.Rip)); lua_settable(L, -3);
+  lua_pushstring(L, 'rsp'); lua_pushinteger(L, int64(c.Rsp)); lua_settable(L, -3);
+  lua_pushstring(L, 'rbp'); lua_pushinteger(L, int64(c.Rbp)); lua_settable(L, -3);
+  lua_pushstring(L, 'rflags'); lua_pushinteger(L, int64(c.EFlags)); lua_settable(L, -3);
+  lua_pushstring(L, 'rbx'); lua_pushinteger(L, int64(c.Rbx)); lua_settable(L, -3);
+  lua_pushstring(L, 'rsi'); lua_pushinteger(L, int64(c.Rsi)); lua_settable(L, -3);
+  lua_pushstring(L, 'rdi'); lua_pushinteger(L, int64(c.Rdi)); lua_settable(L, -3);
+  result:=1;
 end;
 
 function l_getOption(L: Plua_State): integer; cdecl;
@@ -486,6 +662,7 @@ end;
 procedure initializeLuaTuringHV(L: Plua_State);
 begin
   lua_register(L, 'turinghv_showStatus', l_showStatus);
+  lua_register(L, 'turinghv_unwind', l_unwind);
   lua_register(L, 'turinghv_getOption', l_getOption);
   lua_register(L, 'turinghv_setOption', l_setOption);
   lua_register(L, 'turinghv_isActive', l_isActive);
@@ -506,7 +683,11 @@ begin
   lua_register(L, 'turinghv_captureHere', l_captureHere);
   lua_register(L, 'turinghv_setBreakpoint', l_setBreakpoint);
   lua_register(L, 'turinghv_getLog', l_getLog);
+  lua_register(L, 'turinghv_traceStart', l_traceStart);
+  lua_register(L, 'turinghv_traceRead', l_traceRead);
+  lua_register(L, 'turinghv_traceClear', l_traceClear);
   lua_register(L, 'turinghv_bridgeStats', l_bridgeStats);
+  lua_register(L, 'turinghv_threadContext', l_threadContext);
 end;
 
 {$endif}

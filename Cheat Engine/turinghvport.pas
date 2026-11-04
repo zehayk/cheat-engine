@@ -80,6 +80,8 @@ type
     privHandle: THandle;  //our own duplicate of the real handle: Cheat Engine closing its copy can't free the process
     readOnlyRoot: boolean; //the root came from the physical sweep: nothing ties it to this pid authoritatively
     logged: TStringList;
+    thr: TThvThreadArray;  //2026-11-04: the hypervisor's thread list (OpenThread tokens), at most 250 ms old
+    thrTime: qword;
     constructor create;
     destructor destroy; override;
     function Modules(maxage: dword=3000): TThvModEntries;
@@ -127,6 +129,14 @@ function TuringHV_GetModuleFileNameExA(hProcess: HANDLE; hMod: HMODULE; lpFilena
 
 procedure TuringHV_Log(const s: string);
 function TuringHV_LogText: string;
+//2026-11-04: open a thread the way Cheat Engine does, read its context, close it (the Lua test)
+function TuringHV_ThreadContext(tid: dword; out c: TContext; out token: boolean): boolean;
+
+type TThvParkedContext = function(tid: dword; var c: TContext): boolean;
+var
+  //2026-11-04: set by the Turing-HV debugger while it exists: the full context of a thread it holds at a breakpoint
+  //(GetThreadContext on a thread token answers with it before the kernel trap frame -- a held thread has none)
+  TuringHV_ParkedContext: TThvParkedContext = nil;
 
 {$endif}
 
@@ -134,7 +144,7 @@ implementation
 
 {$ifdef windows}
 
-uses math, strutils, plugin;
+uses math, strutils, plugin, DebuggerInterfaceAPIWrapper, DebuggerInterface;
 
 const
   USER_LIMIT = qword($800000000000);
@@ -210,6 +220,12 @@ var
   orig_VQE_StartCache: TVirtualQueryEx_StartCache;
   orig_VQE_EndCache: TVirtualQueryEx_EndCache;
   orig_QueryWorkingSet: function(hProcess: HANDLE; pv: PVOID; cb: DWORD): BOOL; stdcall;
+  orig_OpenThread: TOpenThread;
+  orig_GetThreadContext: TGetThreadContext;
+  orig_SetThreadContext: TSetThreadContext;
+  orig_Wow64GetThreadContext: TWow64GetThreadContext;
+  orig_SuspendThread: TSuspendThread;
+  orig_ResumeThread: TResumeThread;
 
   oldApiPointerChange: TNotifyEvent;
   pointersInstalled: boolean;
@@ -1680,6 +1696,8 @@ begin
   if not found then result:=orig_Thread32Next(hSnapshot, lpte);
 end;
 
+function thrTokRemove(h: THandle): boolean; forward;   //2026-11-04: OpenThread tokens (below)
+
 function HV_CloseHandle(hObject: HANDLE): WINBOOL; stdcall;
 var
   i: integer;
@@ -1704,6 +1722,9 @@ begin
       targetsCS.Leave;
     end;
     if sn<>nil then
+      exit(orig_CloseHandle(hObject));
+
+    if thrTokRemove(hObject) then           //an OpenThread token (2026-11-04)
       exit(orig_CloseHandle(hObject));
 
     if unregisterTarget(hObject)<>nil then
@@ -1791,6 +1812,304 @@ begin
   result:=orig_CreateRemoteThread(h, lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, dwCreationFlags, lpThreadId);
 end;
 
+{ ---- threads: a token, never a Windows handle (2026-11-04) ---------------------------------------------------------
+  OpenThread on a thread of a process opened through the hypervisor used to go to Windows: a real handle on the game's
+  thread, in Cheat Engine's handle table and through the kernel's ObRegisterCallbacks -- the thread list (expanding a
+  thread for its registers, its stack trace, suspend / resume) did it every time. Now it hands out an event handle as a
+  token, as OpenProcess does, and:
+    GetThreadContext   -> the thread's user registers from its KTRAP_FRAME, read through the hypervisor (x64dbg's HV
+                          Mode does the same: TitanTuring.cpp trapContext). Windows saves them there when the thread
+                          enters the kernel by a system call: KTHREAD.InitialStack (+0x28) - 0x190, else
+                          KTHREAD.TrapFrame (+0x90). A frame is believed only when it proves itself -- CS = 0x33, RIP
+                          and RSP in user space, a `syscall` (0F 05) right before RIP -- and never for a thread Windows
+                          says is running. A system call keeps RIP, RSP, RBP, RFLAGS, RBX, RSI and RDI there; every
+                          other register is 0, not invented. (Measured on explorer.exe, 2026-11-02: ~41 of 170
+                          threads; the rest are running, not in a system call, or their kernel stack is paged out.)
+    SetThreadContext, SuspendThread, ResumeThread, Wow64GetThreadContext
+                       -> refused (no hypervisor path; logged once). A thread stopped at a Turing-HV breakpoint has
+                          its registers set through the debugger, not here.
+  Passed to Windows unchanged: threads of processes that are not hypervisor targets; everything when the Windows
+  fallback is on (the user chose visible); and the thread opens of a debugger that runs the thread list itself
+  (Windows / VEH / kernel debugger, chosen by the user as visible) -- they open every thread from their own debugger
+  thread, never from the GUI thread, which is where the thread list's opens come from. }
+const
+  MAXTHREADTOKS = 64;
+  KTH_INITIALSTACK = $28;
+  KTH_TRAPFRAME = $90;
+  KTRAP_SIZE = $190;
+  KTHREAD_RUNNING = 2;
+  USER_TOP = qword($00007FFFFFFF0000);
+
+var
+  thrTokHandles: array[0..MAXTHREADTOKS-1] of THandle;
+  thrTokTid: array[0..MAXTHREADTOKS-1] of dword;
+  thrTokTarget: array[0..MAXTHREADTOKS-1] of TThvTarget;
+
+function threadRow(t: TThvTarget; tid: dword; out row: TThvThread): boolean;
+var
+  i: integer;
+  now: qword;
+begin
+  result:=false;
+  zeromemory(@row, sizeof(row));
+  t.cs.Enter;
+  try
+    now:=GetTickCount64;
+    if (t.thrTime=0) or (now-t.thrTime>=250) then
+    begin
+      if (bridge=nil) or (bridge.EnumThreads(t.eprocess, t.thr)<>THV_OK) then setlength(t.thr, 0);
+      t.thrTime:=now;
+    end;
+    for i:=0 to length(t.thr)-1 do
+      if t.thr[i].tid=tid then
+      begin
+        row:=t.thr[i];
+        exit(true);
+      end;
+  finally
+    t.cs.Leave;
+  end;
+end;
+
+{ The hypervisor target that has a thread with this id, or nil. }
+function threadOwner(tid: dword; out row: TThvThread): TThvTarget;
+var
+  i, n: integer;
+  live: array[0..MAXTARGETS-1] of TThvTarget;
+begin
+  result:=nil;
+  zeromemory(@row, sizeof(row));
+  n:=0;
+  targetsCS.Enter;
+  try
+    for i:=0 to MAXTARGETS-1 do
+      if (targetHandles[i]<>0) and (targets[i]<>nil) and not targets[i].dead then
+      begin
+        live[n]:=targets[i];
+        inc(n);
+      end;
+  finally
+    targetsCS.Leave;
+  end;
+  for i:=0 to n-1 do        //no lock held across the bridge (targets are never freed while Cheat Engine runs)
+    if threadRow(live[i], tid, row) then exit(live[i]);
+end;
+
+function thrTokFind(h: THandle; out tid: dword; out t: TThvTarget): boolean;
+var i: integer;
+begin
+  result:=false;
+  tid:=0;
+  t:=nil;
+  if (h=0) or (h=INVALID_HANDLE_VALUE) then exit;
+  targetsCS.Enter;
+  try
+    for i:=0 to MAXTHREADTOKS-1 do
+      if thrTokHandles[i]=h then
+      begin
+        tid:=thrTokTid[i];
+        t:=thrTokTarget[i];
+        exit(true);
+      end;
+  finally
+    targetsCS.Leave;
+  end;
+end;
+
+function thrTokAdd(h: THandle; tid: dword; t: TThvTarget): boolean;
+var i: integer;
+begin
+  result:=false;
+  targetsCS.Enter;
+  try
+    for i:=0 to MAXTHREADTOKS-1 do
+      if thrTokHandles[i]=0 then
+      begin
+        thrTokTid[i]:=tid;
+        thrTokTarget[i]:=t;
+        thrTokHandles[i]:=h;
+        exit(true);
+      end;
+  finally
+    targetsCS.Leave;
+  end;
+end;
+
+function thrTokRemove(h: THandle): boolean;
+var i: integer;
+begin
+  result:=false;
+  targetsCS.Enter;
+  try
+    for i:=0 to MAXTHREADTOKS-1 do
+      if thrTokHandles[i]=h then
+      begin
+        thrTokHandles[i]:=0;
+        thrTokTarget[i]:=nil;
+        exit(true);
+      end;
+  finally
+    targetsCS.Leave;
+  end;
+end;
+
+{ One KTRAP_FRAME, believed only when it proves itself (see above). }
+function trapFrameAt(t: TThvTarget; f: qword; var c: TContext): boolean;
+var
+  tf: array[0..KTRAP_SIZE-1] of byte;
+  seg: word;
+  rip, rsp: qword;
+  site: array[0..1] of byte;
+begin
+  result:=false;
+  if not rd(kcr3, f, @tf[0], KTRAP_SIZE) then exit;
+  seg:=pword(@tf[$170])^;
+  rip:=pqword(@tf[$168])^;
+  rsp:=pqword(@tf[$180])^;
+  if (seg<>$33) or (rip<$10000) or (rip>=USER_TOP) or (rsp<$10000) or (rsp>=USER_TOP) then exit;
+  if (not rd(t.cr3, rip-2, @site[0], 2)) or (site[0]<>$0F) or (site[1]<>$05) then exit;
+  c.Rip:=rip;
+  c.Rsp:=rsp;
+  c.Rbp:=pqword(@tf[$158])^;
+  c.EFlags:=dword(pqword(@tf[$178])^);
+  c.Rbx:=pqword(@tf[$140])^;
+  c.Rdi:=pqword(@tf[$148])^;
+  c.Rsi:=pqword(@tf[$150])^;
+  c.SegCs:=$33; c.SegSs:=$2B; c.SegDs:=$2B; c.SegEs:=$2B; c.SegFs:=$53; c.SegGs:=$2B;
+  result:=true;
+end;
+
+{ A waiting thread's user registers from its kernel trap frame (exported for the Lua test: TuringHV_ThreadContext). }
+function threadTrapContext(t: TThvTarget; tid: dword; var c: TContext): boolean;
+var
+  row: TThvThread;
+  p: qword;
+  flags: dword;
+begin
+  result:=false;
+  flags:=c.ContextFlags;
+  zeromemory(@c, sizeof(c));
+  c.ContextFlags:=flags;
+  if (kcr3=0) or not threadRow(t, tid, row) or (row.ethread=0) or (row.state=KTHREAD_RUNNING) then exit;
+  if rdq(kcr3, row.ethread+KTH_INITIALSTACK, p) and (p>=KERNEL_BASE) then result:=trapFrameAt(t, p-KTRAP_SIZE, c);
+  if (not result) and rdq(kcr3, row.ethread+KTH_TRAPFRAME, p) and (p>=KERNEL_BASE) then
+  begin
+    zeromemory(@c, sizeof(c));
+    c.ContextFlags:=flags;
+    result:=trapFrameAt(t, p, c);
+  end;
+end;
+
+{ A debugger that runs the thread list itself opens every thread from its own thread (see above). }
+function debuggerOwnsThreadOpens: boolean;
+begin
+  result:=(CurrentDebuggerInterface<>nil) and CurrentDebuggerInterface.controlsTheThreadList and
+          (GetCurrentThreadId<>MainThreadID);
+end;
+
+function HV_OpenThread(dwDesiredAccess: DWORD; bInheritHandle: BOOL; dwThreadId: DWORD): THandle; stdcall;
+var
+  t: TThvTarget;
+  row: TThvThread;
+  h: THandle;
+begin
+  if (not active) or thvOptOSFallback or (dwThreadId=0) or (dwThreadId=GetCurrentThreadId) or debuggerOwnsThreadOpens then
+    exit(orig_OpenThread(dwDesiredAccess, bInheritHandle, dwThreadId));
+  t:=threadOwner(dwThreadId, row);
+  if t=nil then
+    exit(orig_OpenThread(dwDesiredAccess, bInheritHandle, dwThreadId));
+  h:=CreateEvent(nil, true, false, nil);
+  if (h=0) or not thrTokAdd(h, dwThreadId, t) then
+  begin
+    if h<>0 then orig_CloseHandle(h);
+    SetLastError(ERROR_TOO_MANY_OPEN_FILES);
+    exit(0);
+  end;
+  logOnce(t, 'OpenThread', format('OpenThread on %s''s threads: a token, no Windows handle on the thread (registers '+
+    'from its kernel trap frame, when it waits in a system call; suspend / resume / set context refused)',[t.name]));
+  result:=h;
+end;
+
+function HV_GetThreadContext(hThread: THandle; var lpContext: TContext): BOOL; stdcall;
+var
+  t: TThvTarget;
+  tid: dword;
+begin
+  if not thrTokFind(hThread, tid, t) then exit(orig_GetThreadContext(hThread, lpContext));
+  if assigned(TuringHV_ParkedContext) and TuringHV_ParkedContext(tid, lpContext) then exit(true);   //held at a breakpoint
+  result:=threadTrapContext(t, tid, lpContext);
+  if not result then SetLastError(ERROR_NOT_SUPPORTED);   //running, not in a system call, or its kernel stack paged out
+end;
+
+function HV_SetThreadContext(hThread: THandle; const lpContext: TContext): BOOL; stdcall;
+var
+  t: TThvTarget;
+  tid: dword;
+begin
+  if not thrTokFind(hThread, tid, t) then exit(orig_SetThreadContext(hThread, lpContext));
+  logOnce(t, 'SetThreadContext', 'SetThreadContext: refused (no hypervisor path; a thread stopped at a Turing-HV '+
+    'breakpoint has its registers set through the debugger)');
+  SetLastError(ERROR_NOT_SUPPORTED);
+  result:=false;
+end;
+
+function HV_Wow64GetThreadContext(hThread: THandle; var lpContext: CONTEXT32): BOOL; stdcall;
+var
+  t: TThvTarget;
+  tid: dword;
+begin
+  if not thrTokFind(hThread, tid, t) then exit(orig_Wow64GetThreadContext(hThread, lpContext));
+  logOnce(t, 'Wow64GetThreadContext', 'Wow64GetThreadContext: not available through the hypervisor (the 32-bit '+
+    'context; the 64-bit one from the trap frame is)');
+  SetLastError(ERROR_NOT_SUPPORTED);
+  result:=false;
+end;
+
+function HV_SuspendThread(hThread: THandle): DWORD; stdcall;
+var
+  t: TThvTarget;
+  tid: dword;
+begin
+  if not thrTokFind(hThread, tid, t) then exit(orig_SuspendThread(hThread));
+  logOnce(t, 'SuspendThread', 'SuspendThread / ResumeThread: refused (the hypervisor stops a thread only at a '+
+    'Turing-HV breakpoint; Windows'' suspend would need a handle the game can see)');
+  SetLastError(ERROR_NOT_SUPPORTED);
+  result:=DWORD(-1);
+end;
+
+function HV_ResumeThread(hThread: THandle): DWORD; stdcall;
+var
+  t: TThvTarget;
+  tid: dword;
+begin
+  if not thrTokFind(hThread, tid, t) then exit(orig_ResumeThread(hThread));
+  logOnce(t, 'SuspendThread', 'SuspendThread / ResumeThread: refused (the hypervisor stops a thread only at a '+
+    'Turing-HV breakpoint; Windows'' suspend would need a handle the game can see)');
+  SetLastError(ERROR_NOT_SUPPORTED);
+  result:=DWORD(-1);
+end;
+
+{ For the Lua test (turinghvlua.pas): open a thread the way Cheat Engine does, read its context, close it; says whether
+  the handle was a token (no Windows handle) and whether registers were found. }
+function TuringHV_ThreadContext(tid: dword; out c: TContext; out token: boolean): boolean;
+var
+  h: THandle;
+  t: TThvTarget;
+  x: dword;
+begin
+  result:=false;
+  zeromemory(@c, sizeof(c));
+  c.ContextFlags:=CONTEXT_FULL;
+  h:=NewKernelHandler.OpenThread(THREAD_GET_CONTEXT or THREAD_QUERY_INFORMATION, false, tid);
+  token:=thrTokFind(h, x, t);
+  if h=0 then exit;
+  try
+    result:=NewKernelHandler.GetThreadContext(h, c);
+  finally
+    NewKernelHandler.CloseHandle(h);
+  end;
+end;
+
 { ---- psapi for the symbol handler --------------------------------------------------------------------- }
 
 function TuringHV_EnumProcessModulesEx(hProcess: HANDLE; lphModule: PHMODULE; cb: DWORD; var lpcbNeeded: DWORD; dwFilterFlag: DWORD): BOOL; stdcall;
@@ -1863,6 +2182,12 @@ begin
   if @NewKernelHandler.VirtualQueryEx_StartCache<>@HV_VQE_StartCache then begin orig_VQE_StartCache:=NewKernelHandler.VirtualQueryEx_StartCache; NewKernelHandler.VirtualQueryEx_StartCache:=@HV_VQE_StartCache; end;
   if @NewKernelHandler.VirtualQueryEx_EndCache<>@HV_VQE_EndCache then begin orig_VQE_EndCache:=NewKernelHandler.VirtualQueryEx_EndCache; NewKernelHandler.VirtualQueryEx_EndCache:=@HV_VQE_EndCache; end;
   if @NewKernelHandler.QueryWorkingSet<>@HV_QueryWorkingSet then begin orig_QueryWorkingSet:=NewKernelHandler.QueryWorkingSet; NewKernelHandler.QueryWorkingSet:=@HV_QueryWorkingSet; end;
+  if @NewKernelHandler.OpenThread<>@HV_OpenThread then begin orig_OpenThread:=NewKernelHandler.OpenThread; NewKernelHandler.OpenThread:=@HV_OpenThread; end;
+  if @NewKernelHandler.GetThreadContext<>@HV_GetThreadContext then begin orig_GetThreadContext:=NewKernelHandler.GetThreadContext; NewKernelHandler.GetThreadContext:=@HV_GetThreadContext; end;
+  if @NewKernelHandler.SetThreadContext<>@HV_SetThreadContext then begin orig_SetThreadContext:=NewKernelHandler.SetThreadContext; NewKernelHandler.SetThreadContext:=@HV_SetThreadContext; end;
+  if @NewKernelHandler.Wow64GetThreadContext<>@HV_Wow64GetThreadContext then begin orig_Wow64GetThreadContext:=NewKernelHandler.Wow64GetThreadContext; NewKernelHandler.Wow64GetThreadContext:=@HV_Wow64GetThreadContext; end;
+  if @NewKernelHandler.SuspendThread<>@HV_SuspendThread then begin orig_SuspendThread:=NewKernelHandler.SuspendThread; NewKernelHandler.SuspendThread:=@HV_SuspendThread; end;
+  if @NewKernelHandler.ResumeThread<>@HV_ResumeThread then begin orig_ResumeThread:=NewKernelHandler.ResumeThread; NewKernelHandler.ResumeThread:=@HV_ResumeThread; end;
   pointersInstalled:=true;
 end;
 
@@ -1891,6 +2216,12 @@ begin
   NewKernelHandler.VirtualQueryEx_StartCache:=orig_VQE_StartCache;
   NewKernelHandler.VirtualQueryEx_EndCache:=orig_VQE_EndCache;
   NewKernelHandler.QueryWorkingSet:=orig_QueryWorkingSet;
+  NewKernelHandler.OpenThread:=orig_OpenThread;
+  NewKernelHandler.GetThreadContext:=orig_GetThreadContext;
+  NewKernelHandler.SetThreadContext:=orig_SetThreadContext;
+  NewKernelHandler.Wow64GetThreadContext:=orig_Wow64GetThreadContext;
+  NewKernelHandler.SuspendThread:=orig_SuspendThread;
+  NewKernelHandler.ResumeThread:=orig_ResumeThread;
   pointersInstalled:=false;
 end;
 

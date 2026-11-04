@@ -141,7 +141,13 @@ enum thvb_cmd {
     THVB_CMD_DWATCH_ARM_BREAK   = 40,   /* arg0 cr3, arg1 instruction, arg2 length; in: thv_dwatch_operand @0;
                                            out: thv_dwatch_status; ret0 id                                          */
     THVB_CMD_DWATCH_BK_READ     = 41,   /* arg0 id, arg1 index; out: thv_dwatch_status @0, thv_capture_rec @ARRAY_OFF */
-    THVB_CMD_DWATCH_BK_CMD      = 42    /* arg0 id; in: thv_break_cmd @0; out: thv_dwatch_status                      */
+    THVB_CMD_DWATCH_BK_CMD      = 42,   /* arg0 id; in: thv_break_cmd @0; out: thv_dwatch_status                      */
+    /* turing-hv rev150 (SDK 1.13): the native trace -- follow a thread instruction by instruction, it never stops */
+    THVB_CMD_DWATCH_ARM_TRACE   = 43,   /* arg0 cr3, arg1 instruction, arg2 length, arg3 max records (0 = 1000),
+                                           arg4 flags (THV_TRF_OVER or 0); out: thv_dwatch_status; ret0 id          */
+    THVB_CMD_DWATCH_TR_READ     = 44    /* arg0 id, arg1 first, arg2 max; out: thv_dwatch_status @0, thv_trace_info
+                                           @THVB_TRACE_INFO_OFF, thv_trace_rec[] @ARRAY_OFF; ret0 records copied     */
 };
+#define THVB_TRACE_INFO_OFF 128u        /* THVB_CMD_DWATCH_TR_READ: where thv_trace_info sits in data[] */
 
 #endif

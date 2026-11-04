@@ -180,10 +180,11 @@ kernel-driver settings are skipped (logged), because the hypervisor replaces the
 | `turinghv_findWhatAddressesInstructionAccesses(addr)` | Opens the instruction watch's "accessed addresses" dialog; returns `ok, why` (no message box). |
 | `turinghv_captureHere(addr)` | Arms a capture breakpoint: snapshots every register, the stack, the code and the memory around `addr` the first time it runs, then disarms. Returns `ok, why`. |
 | `turinghv_setBreakpoint(addr)` | Arms a parking breakpoint: the first user-mode thread to reach `addr` stops in a window you can step / continue. Returns `ok, why`. |
+| `turinghv_unwind(rip, rsp [, rbp])` | The decoded call stack from there: an array of `{rip, rsp, call, how, name}` (`call` = a CALL precedes the return address). |
 | `turinghv_bridgeStats([reset])` | Requests the bridge made since the last reset, per command, and the microseconds they took. |
 | `turinghv_getLog()` | Cheat Engine's backend log. |
 | `turinghv_showStatus()` | Opens the status window. |
-| `turinghv_getOption(name)` / `turinghv_setOption(name, bool)` | Options: OSHandle, OSFallback, SharedCodeWrites, SlowCR3. |
+| `turinghv_getOption(name)` / `turinghv_setOption(name, bool)` | Options: OSHandle, OSFallback, SharedCodeWrites, SlowCR3, WatchHarder, Debugger (the Turing-HV debugger, this session), DebuggerSnapshot. |
 
 The existing `getPEB()` also works for hypervisor targets.
 
@@ -206,7 +207,7 @@ Everything below was verified end to end against the live hypervisor (§7), unle
 | Pointer scanner, structure dissect, dissect code | the above | *(not separately tested)* |
 | Modules (`enumModules`, `module+offset`) | PEB loader walk | Full paths; WOW64 32-bit modules from PEB32 (System32 paths mapped to SysWOW64, the files a 32-bit process actually loaded). Falls back to the hypervisor's own walk, which gives names only. |
 | Symbols: exports, PDBs | dbghelp by path | The symbol loader takes the module list from the backend instead of psapi. |
-| Thread list | `ENUM_THREADS` | Thread IDs. Context, suspend and resume go through Windows `OpenThread` and work only if Windows allows it. |
+| Thread list | `ENUM_THREADS` | Thread IDs. **2026-11-04: no Windows handle on the game's threads.** `OpenThread` on a thread of a process opened through Turing-HV returns a token (like `OpenProcess`'s); `GetThreadContext` on it answers with the thread's full context when the Turing-HV debugger holds it at a breakpoint, else with the user registers Windows saved in its kernel trap frame when it last made a system call (RIP, RSP, RBP, RFLAGS, RBX, RSI, RDI; the rest 0), read through the hypervisor and believed only when the frame proves itself (CS 0x33, a `syscall` right before RIP). A thread that is running, or not in a system call, has no registers to show. Suspend, resume, setting a context and the 32-bit (WOW64) context are refused and logged. With the Windows fallback on, or under a Windows / VEH / kernel debugger the user chose, threads open through Windows as before. Tested: `run_tests.ps1` (tokens, x64 + x86; trap-frame RIP = `ntdll.NtDelayExecution+0x14`), `run_debugger_test.ps1` (every thread a token; the held thread's stopped context). |
 | 32/64-bit detection | PEB32 present | Also with no Windows handle. |
 | Auto assembler without `alloc` | writes | `define`/`aobscan` + writes into writable memory. Tested. |
 | "Find out what writes to this address" | data watch (turing-hv rev146b) | **Exact**: every write to the watched bytes, counted per instruction by the hypervisor, with all registers and 8 stack qwords of each instruction's first hit (before it ran). The instruction listed is the writer itself. Nested image only; see §4. On an image or bridge older than rev146b: the sampled page watch (writes only). |
@@ -214,9 +215,31 @@ Everything below was verified end to end against the live hypervisor (§7), unle
 | "Find out what addresses this instruction accesses" | instruction watch (turing-hv rev147) | Memory viewer, right-click the instruction: the item marked "(Turing-HV)". Every run of the instruction, one line per address it accessed, with that address's run count and the registers of its first run (before it ran). Feeds Cheat Engine's own dialog (values, filter, "show registers", add to the address list). See §4 for the cost. |
 | "Capture a snapshot here, then disarm" | capture breakpoint (turing-hv rev148) | Memory viewer, right-click the instruction: "Capture a snapshot here, then disarm (Turing-HV)". The first time the instruction runs, a window shows every register, RFLAGS, the segments and FS/GS bases, the stack from RSP (each return address symbolized), the code around RIP (hex + a live disassembly), the memory each register and the operand point at, the thread's PID/TID, and XMM/MXCSR; then it disarms. What and how much to save is set in Turing-HV > "Capture breakpoint: snapshot settings...". Lua `turinghv_captureHere(addr)`. The one-shot cost is tens of microseconds; see §4. Does not stop the thread (unlike a debugger breakpoint). |
 | Breakpoint, step into / over, continue, run to cursor | parking breakpoint (turing-hv rev149) | Memory viewer, right-click the instruction: "Set a parking breakpoint here (Turing-HV)". The first user-mode thread that reaches it **stops** there (only that thread; the rest of the program runs on) and a debugger window shows its context with Step into / Step over / Continue / Run to cursor / Set register / Release and a dropdown of the stopped threads. No `int3`, no debug register, nothing the game can see -- the thread is held by re-faulting its code page. Stepping holds within the breakpoint's function page(s); step-over catches the call's return there. Lua `turinghv_setBreakpoint(addr)`. See §4. |
+| **Cheat Engine's own debugger** (toggle breakpoint F5, step into F7, step over F8, run F9, run to cursor, change registers, conditional breakpoints, "change register at this location", Break and Trace, Lua `debug_*`) | the Turing-HV debugger (`turinghvdebugger.pas`) on the parking breakpoint | **Settings > Debugger Options > "Turing-HV hypervisor debugger"** (a check box under CE's own choices; CE's own choice is left as it is). Used for processes opened through Turing-HV. Debugging such a process with it unticked asks which debugger to use (the Windows one is visible to the game). No debug port, no handle, no debug register, nothing in the game changes: only the thread that hits a breakpoint stops. "Find out what writes / accesses" goes to the data watch. Tested end to end (`tests\run_debugger_test.ps1`, §7). See §4 for what it can't do. |
+| Snapshot breakpoints (nothing stops) | the capture breakpoint, as the debugger's breakpoint | The second check box, "...take a snapshot and let the thread run on": every hit is shown as a break (registers, stack, code) while the thread has already run on; re-armed after each. No stepping (the thread is gone). |
+| **Break and Trace, native** (the thread never stops) | native trace (turing-hv rev150, `turinghvtrace.pas`) | Memory viewer > Break and Trace: tick **"Turing-HV native trace (the thread never stops)"** (shown for a Turing-HV target; ticked by default when no debugger runs, like DBVM's own). The first user-mode thread that reaches the instruction is followed by the hypervisor one instruction at a time -- on any page, into calls and out through returns -- and each instruction's registers (before it ran) land in Cheat Engine's trace tree as usual (calls nested, "Step over" = callees run unrecorded). No debugger is attached at all; the thread's own RFLAGS never shows the trap flag. It ends before PUSHF / POPF / IRET / SYSCALL / INT n (they would see or eat the step), at an interrupt or exception due for the thread, or after the count (at most 2048); the window title says which. One trace at a time. Lua `turinghv_traceStart / traceRead / traceClear`. |
+| Decoded call stack | `turinghvstack.pas`: the modules' own unwind tables (`.pdata` / UNWIND_INFO, like RtlVirtualUnwind and x64dbg) | In the capture and breakpoint windows (a list at the top: double-click a frame to see it in the memory viewer) and as text. Each return address is checked for a CALL before it. Unwind tables that aren't resident are read from the module's file. Lua `turinghv_unwind(rip, rsp [, rbp])`. Tested: 5 frames up to `RtlUserThreadStart`, all call-checked. |
 | CR3 when EPROCESS lies | tracker → watch → sweep | For targets that scramble `DirectoryTableBase`. Tested with the DTB rung skipped (the tracker answered in 250 ms). |
 | Hypervisor status, text log, trust list | `STATUS`, `LOG_READ`, `TRUST_QUERY` | Status window. |
 | Target exit | liveness check | Reads and writes are refused afterwards. Tested with and without a Windows handle. |
+
+**Where the Turing-HV items are (2026-11-04: every menu that has Cheat Engine's own item has the hypervisor's beside
+it).** They show only for a process opened through Turing-HV, and need no debugger attached.
+
+| Menu | Turing-HV items |
+|---|---|
+| Address list (right-click a record) | Find out what writes / accesses this address (write watch / access watch) |
+| **Scan results** (right-click a result) | the same two, on the selected result, sized by the scan's value type (**new 2026-11-04**) |
+| Memory viewer, hex view > **Data Breakpoint** | the same two, on the selected bytes (1-4096) (**new 2026-11-04**) |
+| Memory viewer, disassembler | Find out what addresses this instruction accesses; Capture a snapshot here, then disarm; Set a parking breakpoint here |
+| "The following opcodes write to / access ..." window (right-click an instruction) | Find out what addresses this code accesses (the instruction watch) (**new 2026-11-04**; Cheat Engine's own item there needs a debugger) |
+| **Code list** (Advanced options, right-click an entry) | Find out what addresses this code accesses / reads from / writes to (**new 2026-11-04**) |
+| Turing-HV menu | write / access watch on the address list's selected record, options, status |
+
+With the Turing-HV debugger chosen (Settings > Debugger Options), Cheat Engine's own "Find out what writes / accesses"
+items go to the data watch too. Tested: `run_tests.ps1` "menus" checks -- the scan result's two watches open on the
+selected address, the found-code dialog's item names the address the writer writes, every menu has its items (the
+build before 2026-11-04 fails exactly those 5).
 
 **With the Windows fallback on** (only if Windows grants a full handle), these also work: `alloc`/`dealloc` in auto
 assembler, Lua `allocateMemory`, writes into read-only pages (code patching, NOPs) and into freshly allocated
@@ -281,6 +304,24 @@ Windows afterwards. This is Windows doing it, not the hypervisor.
   instructions can't be single-stepped (SYSCALL, IRET, ...), so stepping those lets the thread run to the next hit. No
   `int3`, debug register or memory change is used, so the game cannot see the breakpoint -- only that the thread took
   longer. Up to 8 threads can be stopped at one breakpoint at once; the dropdown picks which to control.
+- **The Turing-HV debugger** (Cheat Engine's own debugger on the parking breakpoint) inherits the parking breakpoint's
+  limits and says so instead of pretending: one breakpoint per 4 KiB page (the hypervisor watches pages; a second one
+  on the same page is refused with the address of the first), 4 in all (shared with the other Turing-HV watches).
+  **A step that leaves the breakpoint's page (2026-11-03)** -- a call or jump to another page, a ret to the caller,
+  code running off the page's end -- is done with a **temporary breakpoint at the landing** (computed with Cheat
+  Engine's disassembler from the stopped thread's registers: a direct target, a RIP-relative pointer, a taken or
+  not-taken conditional, the return address at RSP): armed, the thread released, its stop there reported as the step;
+  it goes as soon as the thread is let go from it, so a shared system-DLL page is armed only for the microseconds the
+  thread needs to get there. It takes a free watch (4 in all) and refuses a page that already has one of ours; an
+  indirect jump through a register (`jmp rax`, `call [rbx+8]`) is not computed and steps as before (it runs until the
+  next hit if it leaves the page). (`turinghvdebugger.pas` `stepLanding` / `stepViaTemp`; test: zz_turinghv_dbg.lua
+  6b.) A data breakpoint can't stop the writer (Find out what writes / accesses records every one instead);
+  no "Break" (pause the process) and no exception breakpoints; only the general registers and RIP can be changed.
+  Break and Trace therefore traces within the breakpoint's page (use "step over instead of single step"). A step that
+  doesn't land in 3 s re-arms the breakpoint (the thread stops there the next time). **Held threads got away on rev149 to rev150e** (the hypervisor's "abandoned watch" test wrapped when a read was
+stamped microseconds after a fault and switched the breakpoint page off; its re-arm on every read caught the thread
+again, so it mostly looked held and a step "landed where it started"). **Fixed in rev150f** (2026-11-04): a held
+thread stays held with no reads at all, and every step test passes (RUN-ALL 16/0, run_debugger_test 44/0).
 - **The sampled page watch** (images and bridges before rev146, writes only) records the *first* write to the
   4 KiB page after each re-arm (~10 ms), keeping the hits that landed on the watched bytes. On a busy page the first
   write is almost never ours (measured: 2 of 90 in 4 s, the rest elsewhere on the page), so a rare writer is easily
@@ -348,12 +389,17 @@ instruction accesses"** (the instruction watch, §3), **rev148 the capture break
 not stop the thread), and **rev149 the parking breakpoint** (§3) -- a thread actually **stops** at the instruction and
 the window gives Step into / Step over / Continue / Run to cursor / Set register. The thread is held by re-faulting its
 code page (no `int3`, no debug register, nothing the game can see), and only that thread stops -- the process is not
-frozen (freezing the whole process would need the guest's cooperation and is not done). **Not covered:** "Break and
-trace" (bulk tracing), conditional breakpoints evaluated in the hypervisor, Ultimap, and the thread-list context view;
-and a step or step-over that leaves the breakpoint's own page runs free until the breakpoint is next hit (see §4).
+frozen (freezing the whole process would need the guest's cooperation and is not done). **rev150 adds the native
+trace** (§3): "Break and trace" with the thread never stopped, followed across pages. **Not covered:** conditional
+breakpoints evaluated in the hypervisor and Ultimap (the thread-list context view: 2026-11-04, from the kernel trap frame -- see section 3); and a step or step-over of a
+*parked* thread that leaves the breakpoint's own page runs free until the breakpoint is next hit (see §4).
 
-**CE features blocked:** attach debugger, break/step/run, "Break and trace", conditional breakpoints, changing
-registers on breakpoint, the thread context in the thread list, Ultimap.
+**Which debugger (2026-11-03; corrects the 2026-11-01 audit's finding 1 and this section's old "blocked" list):** on a
+process opened through Turing-HV, attaching asks "Which debugger?" (`CEDebugger.pas` `startdebuggerifneeded`): the
+Turing-HV debugger (breakpoints, step into / over, continue, run to cursor, set register, break and trace, snapshot
+mode -- all held by the hypervisor) or Cheat Engine's own Windows debugger, labelled visible to the game. The choice is
+remembered (Settings > Debugger Options). **Still not available through the hypervisor:** conditional breakpoints
+evaluated in the hypervisor, Ultimap. (The thread list shows registers since 2026-11-04: the held thread in full, a waiting one from its kernel trap frame.)
 
 **Needed:** the kind of interface DBVM gives Cheat Engine (`dbvm_watch_reads/writes/executes`, its
 `TDBVMDebugInterface`), on NPT:
@@ -445,7 +491,10 @@ New files (all under `Cheat Engine\`):
 | `turinghvport.pas` | The backend: pointer swap, handle table, CR3 ladder, PEB, modules, regions, Toolhelp, psapi stand-ins, liveness, OS fallback, log. |
 | `turinghvbridge.pas` | Transport: starts the bridge, owns the channel, typed wrappers for every bridge command; record layouts are checked against C at startup. |
 | `turinghvui.pas` | The Turing-HV menu, options (registry `TuringHV.*`), the status/log/trust window (built in code, no .lfm). |
-| `turinghvwatch.pas` | Sampled "find what writes" on the write watch, feeding CE's FoundCode dialog. |
+| `turinghvwatch.pas` | The watches (find what writes / accesses, the instruction watch), the capture and parking breakpoint windows. |
+| `turinghvdebugger.pas` | The Turing-HV debugger: a `TDebuggerInterface` on the parking / capture breakpoint (Cheat Engine's whole debugger runs on it). |
+| `turinghvstack.pas` | The x64 call-stack unwinder (the modules' unwind tables; live, snapshot, or the module file). |
+| `turinghvtrace.pas` | The native trace (rev150): arm / read / clear, and the tracer window's progress panel. |
 | `turinghvlua.pas` | The `turinghv_*` Lua functions. |
 | `turinghv\thvbridge\thvbridge.c`, `thvbridge_proto.h` | The bridge and the wire format. |
 | `turinghv\build_thvbridge.ps1` | Builds the bridge and copies the matching `turinghv.dll`. |
@@ -462,6 +511,11 @@ Changes to upstream files (small, each marked "Turing-HV"):
 | `memscan.pas`, `pointervaluelist.pas` | "Present memory only" doesn't ask Windows' working set for hypervisor handles (every reported page is present). |
 | `LuaHandler.pas` | `getPEB()` for hypervisor handles; registers the `turinghv_*` functions. |
 | `FoundCodeUnit.pas` | An `onStopWatch` hook so the dialog's Stop/close also stops a hypervisor watch. |
+| `debuggertypedefinitions.pas` | The breakpoint method `bpmTuringHV` ("Turing-HV Breakpoint"). |
+| `debughelper.pas` | The Turing-HV debugger as the interface (setting + a Turing-HV target); `bpmTuringHV` wherever DBVM's / GDB's method is forced; arming / removing it; Find out what writes / accesses to the data watch. |
+| `debugeventhandler.pas` | `EXCEPTION_TURINGHV_BREAKPOINT` (a held thread, or a step that landed); step over a CALL / REP as the hypervisor's run-to (a one-shot breakpoint there would share the page). |
+| `CEDebugger.pas` | "Which debugger?" when a Turing-HV target is debugged without the Turing-HV debugger chosen. |
+| `frmTracerUnit.pas`, `frmTracerConfigUnit.pas` | Break and Trace with `bpmTuringHV` on the Turing-HV debugger; the "Turing-HV native trace" check box (created at run time) and loading its records into the trace tree. (Upstream's DBVM loader, `DBVMTraceDone`, writes into a context it never allocates -- `TTraceDebugInfo.Create` leaves `context` nil; the Turing-HV loader allocates its own, DBVM's is left as it is.) |
 
 ## 7. Tests
 
@@ -511,3 +565,50 @@ watches, what each cost in bridge requests (`turinghv_bridgeStats`). `THVBENCH_A
 
 `tests\bridgetest.c` is a smoke test of the bridge protocol that needs no trust: startup, the gate's verdict, rejection
 of malformed requests, CR3 0 refusal, and clean shutdown.
+
+### 7.2 The Turing-HV debugger (2026-11-02)
+
+`Cheat Engine\turinghv\tests\run_debugger_test.ps1` (elevated) runs Cheat Engine's own debugger on the hypervisor
+against antidebug-lab's `adbg_target` (a protected-game stand-in running ~40 anti-debug detectors): a breakpoint on
+`hot_target`, step into twice, a register edit (RBX) while stopped, step over, continue to the next hit, remove; then
+snapshot mode on `cold_target` (hit, re-armed, hit again); and the decoded call stack at the breakpoint. It builds
+nothing: it runs `bin\cheatengine-x86_64-thv.exe` (the dev build, `cheatengine_thvdev.lpi`, so a running Cheat Engine
+is left alone).
+
+On the rev149 image: the breakpoint (stopped exactly at `hot_target`), the call stack (5 frames, `adbg_target.exe+456B`
+-> `+FF30` -> `KERNEL32.BaseThreadInitThunk+14` -> `ntdll.RtlUserThreadStart+21`, every return address preceded by a
+CALL) and snapshot mode PASS; the target saw **DEBUGGER 0, INTEGRITY 0** (a held thread shows in its TIMING checks, by
+design). Steps and continue are unreliable on rev149 -- the hypervisor bug rev149b fixes (a held thread escapes after a
+let-through); expected to pass on rev149b.
+
+The backend suite (`run_tests.ps1 -Exe cheatengine-x86_64-thv.exe`) on the same build: **85 / 85** (its instruction-
+watch phase had been silently skipped by a test bug -- `splitDisassembledString` returns extra, opcode, bytes,
+address, not celua.txt's order -- now fixed; the test targets are also linked without incremental-link thunks).
+
+The capture and breakpoint windows also gained: the call stack as a list (double-click = memory viewer), the
+instructions that ran straight into RIP, XMM as floats / doubles, symbols next to registers, RFLAGS without the
+hypervisor's own TF, and (capture) Save..., Go to RIP, Capture again.
+
+### 7.3 The native trace (2026-11-03, rev150)
+
+`run_debugger_test.ps1` ends with the native trace (Lua `turinghv_trace*`, the same calls the tracer window makes),
+on the same `adbg_target`:
+
+- `hot_target`: the first record is `hot_target` itself, then +1 (RSP 8 lower after `push rbp`), +4 (RBP = RSP after
+  `mov rbp,rsp`); no record shows the trap flag; it ends **before** the function's `pushfq` (reason NOSTEP) and the
+  last record IS that `pushfq` -- recorded, never stepped, so the target's own TF check (it reads RFLAGS right there)
+  sees nothing.
+- `cold_target`: followed through its `ret` into the caller and the next `call` onto `hot_target`'s page (`.hot`).
+- the same with step over: nothing recorded on the callee's page, yet more steps than records (the callee was
+  followed, unrecorded).
+
+An interrupt due for the thread ends a trace early (reason EVENT): the test tries up to 4 times. On an image or bridge
+older than rev150 the trace part says SKIP.
+
+**On the rev150 image (2026-11-03, 02:02): 32 / 35.** All three native traces PASS live (`hot_target` 177 records in
+154 us ending at its `pushfq`; `cold_target` 188 records through its `ret` and the next `call` onto `.hot`; step over 11
+records for 187 steps), the snapshot breakpoint, continue, the call stack, the register edit; the target saw DEBUGGER 0,
+INTEGRITY 0. The 3 failures are step positions -- the hypervisor bug rev150b fixes (a step cut short by an interrupt or
+by Hyper-V was reported as a new stop where it started, and an interrupt in flight let the thread run on). The register
+edit is RDX now: the test used to set RBX, which is the caller's timing-loop counter (`cmp rbx, 2000; jne`) -- the
+target's main thread then looped for ever and never called `cold_target` again (the earlier rev150 run's "failures").

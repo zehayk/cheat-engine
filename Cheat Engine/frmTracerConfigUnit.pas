@@ -46,11 +46,14 @@ type
   private
     { private declarations }
     fDataTrace: boolean;
+    fTHVDefaulted: boolean;
+    procedure cbTHVNativeTraceChange(Sender: TObject);
     procedure setDataTrace(state: boolean);
     function getBreakpointmethod: TBreakpointmethod;
     procedure setBreakPointMethod(m: TBreakpointmethod);
   public
     { public declarations }
+    cbTHVNativeTrace: TCheckBox;   //turing-hv rev150: the hypervisor's native trace (created at run time)
     property DataTrace: boolean read fDataTrace write setDataTrace;
     property breakpointmethod: TBreakpointMethod read getBreakpointMethod write setBreakpointMethod;
   end; 
@@ -62,12 +65,16 @@ implementation
 { TfrmTracerConfig }
 
 uses NewKernelHandler, DebugHelper, debuggerinterface, DebuggerInterfaceAPIWrapper,
-  formsettingsunit, DBVMDebuggerInterface, GDBServerDebuggerInterface;
+  formsettingsunit, DBVMDebuggerInterface, GDBServerDebuggerInterface, turinghvdebugger
+  {$ifdef windows}, turinghvtrace{$endif};
 
 function TfrmTracerConfig.getBreakpointmethod: TBreakpointmethod;
 begin
   if (CurrentDebuggerInterface<>nil) and (CurrentDebuggerInterface is TDBVMDebugInterface) then
     exit(bpmDBVMNative);
+  if ((CurrentDebuggerInterface<>nil) and (CurrentDebuggerInterface is TTuringHVDebugInterface)) or
+     ((CurrentDebuggerInterface=nil) and thvDbgUseHV) then
+    exit(bpmTuringHV);
 
   result:=bpmDebugRegister;
 
@@ -103,6 +110,22 @@ end;
 
 procedure TfrmTracerConfig.FormCreate(Sender: TObject);
 begin
+  //turing-hv rev150: "Turing-HV native trace", under DBVM's own (shown only for a turing-hv target)
+  cbTHVNativeTrace:=TCheckBox.create(self);
+  cbTHVNativeTrace.parent:=self;
+  cbTHVNativeTrace.caption:='Turing-HV native trace (the thread never stops)';
+  cbTHVNativeTrace.hint:='The hypervisor follows the first thread to reach the instruction, one instruction at a time, '+
+    'on any page, and records its registers -- the thread is never stopped and sees no debugger. '+
+    'It ends at an interrupt, an exception or a system call; up to 2048 instructions.';
+  cbTHVNativeTrace.showhint:=true;
+  cbTHVNativeTrace.AnchorSideLeft.Control:=Label1;
+  cbTHVNativeTrace.AnchorSideTop.Control:=cbDBVMTriggerCOW;
+  cbTHVNativeTrace.AnchorSideTop.Side:=asrBottom;
+  cbTHVNativeTrace.BorderSpacing.Top:=2;
+  cbTHVNativeTrace.visible:=false;
+  cbTHVNativeTrace.OnChange:=cbTHVNativeTraceChange;
+  Label1.AnchorSideTop.Control:=cbTHVNativeTrace;
+
   if hasEPTSupport=false then
     rbBPDBVM.visible:=false;
 
@@ -122,13 +145,56 @@ begin
 end;
 
 procedure TfrmTracerConfig.FormShow(Sender: TObject);
+var avail: boolean;
 begin
+  {$ifdef windows}
+  avail:=(not fDataTrace) and thvNativeTraceAvailable;
+  {$else}
+  avail:=false;
+  {$endif}
+  cbTHVNativeTrace.visible:=avail;
+  if not avail then
+    cbTHVNativeTrace.checked:=false
+  else
+  if not fTHVDefaulted then
+  begin
+    fTHVDefaulted:=true;
+    if CurrentDebuggerInterface=nil then  //no debugger running: the hypervisor's trace, like DBVM's
+      cbTHVNativeTrace.checked:=true;
+  end;
 
  // autosize:=false;
 end;
 
+procedure TfrmTracerConfig.cbTHVNativeTraceChange(Sender: TObject);
+begin
+  if cbTHVNativeTrace.checked then
+  begin
+    cbDBVMBreakAndTrace.checked:=false;
+    cbStayInsideInitialModule.checked:=false;
+    cbStayInsideInitialModule.enabled:=false;
+    cbDereferenceAddresses.enabled:=false;
+    cbSaveStack.enabled:=false;
+    cbSkipSystemModules.enabled:=false;
+    cbStepOverRep.enabled:=false;
+    groupbox1.enabled:=false;
+    Label2.enabled:=false;
+    edtStopCondition.enabled:=false;
+    Label3.enabled:=false;
+    edtStartCondition.enabled:=false;
+  end
+  else
+  begin
+    cbSaveStack.enabled:=true;
+    cbStepOverRep.enabled:=not cbStepOver.checked;
+    cbDBVMBreakAndTraceChange(nil);   //the rest back as Cheat Engine has them
+  end;
+end;
+
 procedure TfrmTracerConfig.cbDBVMBreakAndTraceChange(Sender: TObject);
 begin
+  if cbDBVMBreakAndTrace.Checked and (cbTHVNativeTrace<>nil) and cbTHVNativeTrace.checked then
+    cbTHVNativeTrace.checked:=false;
 
   if cbDBVMBreakAndTrace.Checked then
   begin

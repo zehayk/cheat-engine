@@ -214,7 +214,7 @@ implementation
 uses CEDebugger, KernelDebugger, formsettingsunit, FormDebugStringsUnit,
      frmBreakpointlistunit, plugin, memorybrowserformunit, autoassembler,
      pluginexports, networkInterfaceApi, ProcessHandlerUnit, Globals, LuaCaller,
-     vmxfunctions, LuaHandler, frmDebuggerAttachTimeoutUnit, DBVMDebuggerInterface,
+     vmxfunctions, LuaHandler, frmDebuggerAttachTimeoutUnit, DBVMDebuggerInterface, turinghvdebugger, turinghvwatch, turinghvport,
      symbolhandlerstructs, contexthandler, GDBServerDebuggerInterface,
      gdbserverconnectdialog, LazLogger;
 
@@ -897,6 +897,8 @@ begin
 
   if CurrentDebuggerInterface is TGDBServerDebuggerInterface then
     breakpoint^.breakpointMethod:=bpmGDB;
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+    breakpoint^.breakpointMethod:=bpmTuringHV;
 
   AllThreadsAreSet:=true;
 
@@ -1286,6 +1288,19 @@ begin
       {$endif}
     end;
 
+    bpmTuringHV:
+    begin
+      Log('Setting Turing-HV Breakpoint');
+      if not (CurrentDebuggerInterface is TTuringHVDebugInterface) then raise exception.create('Only the Turing-HV debugger can set Turing-HV breakpoints');
+      case breakpoint^.breakpointTrigger of
+        bptExecute:breakpoint^.debuggerinterfacewatchid:=TTuringHVDebugInterface(CurrentDebuggerInterface).setExecuteBP(breakpoint^.address);
+        bptAccess: breakpoint^.debuggerinterfacewatchid:=TTuringHVDebugInterface(CurrentDebuggerInterface).setAccessBP(breakpoint^.address, breakpoint^.size);
+        bptWrite:  breakpoint^.debuggerinterfacewatchid:=TTuringHVDebugInterface(CurrentDebuggerInterface).setWriteBP(breakpoint^.address, breakpoint^.size);
+      end;
+      if breakpoint^.debuggerinterfacewatchid<>-1 then
+        breakpoint^.active:=true;
+    end;
+
     bpmGDB:
     begin
       Log('Setting GDB Breakpoint');
@@ -1567,7 +1582,10 @@ begin
     dbvm_watch_delete(breakpoint^.debuggerinterfacewatchid)
   else
   if breakpoint^.breakpointMethod=bpmGDB then
-    TGDBServerDebuggerInterface(CurrentDebuggerInterface).deleteBreakpoint(breakpoint^.debuggerinterfacewatchid);
+    TGDBServerDebuggerInterface(CurrentDebuggerInterface).deleteBreakpoint(breakpoint^.debuggerinterfacewatchid)
+  else
+  if (breakpoint^.breakpointMethod=bpmTuringHV) and (CurrentDebuggerInterface is TTuringHVDebugInterface) then
+    TTuringHVDebugInterface(CurrentDebuggerInterface).deleteBreakpoint(breakpoint^.debuggerinterfacewatchid);
 
   breakpoint^.active := false;
 
@@ -1655,6 +1673,8 @@ begin
 
   if CurrentDebuggerInterface is TGDBServerDebuggerInterface then
     bpm:=bpmGDB;
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+    bpm:=bpmTuringHV;
 
   if (bpm in [bpmInt3,bpmGDB]) and (bpt=bptExecute) then
   begin
@@ -1961,11 +1981,20 @@ var
 begin
   if size=0 then exit;
 
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+  begin
+    //Turing-HV: the hypervisor's data watch records every writer / reader, exactly, without stopping it
+    if bpt=bptWrite then TuringHV_FindWhatWrites(address, size) else TuringHV_FindWhatAccesses(address, size);
+    exit;
+  end;
+
   if CurrentDebuggerInterface is TDBVMDebugInterface then
     breakpointmethod:=bpmDBVMNative;  //memory watch bp's all the way
 
   if CurrentDebuggerInterface is TGDBServerDebuggerInterface then
     breakpointmethod:=bpmGDB;
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+    breakpointmethod:=bpmTuringHV;
 
   if breakpointmethod=bpmint3 then //not possible for this
     breakpointmethod:=bpmDebugRegister;
@@ -2313,6 +2342,8 @@ begin
     method:=bpmDBVMNative
   else
     method:=preferedBreakpointMethod;
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+    method:=bpmTuringHV;
 
   usedDebugRegister:=-1;
   if method=bpmDebugRegister then
@@ -2353,6 +2384,8 @@ begin
     method:=bpmDBVMNative
   else
     method:=preferedBreakpointMethod;
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+    method:=bpmTuringHV;
 
   usedDebugRegister:=-1;
   if method=bpmDebugRegister then
@@ -2390,6 +2423,8 @@ begin
 
     if CurrentDebuggerInterface is TGDBServerDebuggerInterface then
       breakpointmethod:=bpmGDB;
+    if CurrentDebuggerInterface is TTuringHVDebugInterface then
+      breakpointmethod:=bpmTuringHV;
 
     if breakpointmethod=bpmDebugRegister then
     begin
@@ -2514,6 +2549,8 @@ begin
 
   if CurrentDebuggerInterface is TGDBServerDebuggerInterface then
     method:=bpmGDB;
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+    method:=bpmTuringHV;
 
   usedDebugRegister:=-1;
   if method=bpmDebugRegister then
@@ -2787,6 +2824,8 @@ var
 begin
   if CurrentDebuggerInterface is TDBVMDebugInterface then
     bpm:=bpmDBVMNative;
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+    bpm:=bpmTuringHV;
 
   found := False;
 
@@ -2919,6 +2958,8 @@ var
 begin
   if CurrentDebuggerInterface is TDBVMDebugInterface then
     bpm:=bpmDBVMNative;
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+    bpm:=bpmTuringHV;
 
   found := False;
 
@@ -2976,6 +3017,8 @@ var
 begin
   if CurrentDebuggerInterface is TDBVMDebugInterface then
     bpm:=bpmDBVMNative;
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+    bpm:=bpmTuringHV;
 
   found := False;
 
@@ -3034,6 +3077,8 @@ begin
 
   if CurrentDebuggerInterface is TGDBServerDebuggerInterface then
     breakpointmethod:=bpmGDB;
+  if CurrentDebuggerInterface is TTuringHVDebugInterface then
+    breakpointmethod:=bpmTuringHV;
 
   //find the breakpoint if it is already assigned and then remove it, else add the breakpoint
   found := False;
@@ -3388,6 +3433,9 @@ begin
     begin
 
       {$ifdef windows}
+      if thvDbgUseHV and TuringHV_IsHVHandle(processhandle) then
+        CurrentDebuggerInterface:=TTuringHVDebugInterface.create   //Turing-HV: the hypervisor's breakpoints, no debug port
+      else
       if formsettings.cbUseWindowsDebugger.checked then
         CurrentDebuggerInterface:=TWindowsDebuggerInterface.create
       else if formsettings.cbUseVEHDebugger.checked then

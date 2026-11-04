@@ -34,7 +34,7 @@ type
   TContinueOption = (co_run=0, co_stepinto=1, co_stepover=2, co_runtill=3);
 
 type
-  TBreakpointMethod = (bpmInt3=0, bpmDebugRegister=1, bpmException=2, bpmDBVM=3, bpmDBVMNative=4, bpmGDB=5);
+  TBreakpointMethod = (bpmInt3=0, bpmDebugRegister=1, bpmException=2, bpmDBVM=3, bpmDBVMNative=4, bpmGDB=5, bpmTuringHV=6);  //Turing-HV: the hypervisor's parking / capture breakpoint
 
 type
   TBreakOption = (bo_Break = 0, bo_ChangeRegister = 1, bo_FindCode = 2, bo_FindWhatCodeAccesses = 3, bo_BreakAndTrace=4, bo_OnBreakpoint=5, bo_ChangeRegisterEx = 6);
@@ -271,6 +271,7 @@ resourcestring
   rsExceptionBreakpoint =  'Exception Breakpoint';
   rsDBVMBreakpoint =       'DBVM Breakpoint';
   rsDBVMNativeBreakpoint = 'DBVM-Level Breakpoint';
+  rsTuringHVBreakpoint = 'Turing-HV Breakpoint';
   rsBreak = 'Break';
   rsChangeReg = 'Change reg';
   rsFindCode = 'Find code';
@@ -325,6 +326,7 @@ begin
     bpmException:      result:=rsExceptionBreakpoint;
     bpmDBVM:           result:=rsDBVMBreakpoint;
     bpmDBVMNative:     result:=rsDBVMNativeBreakpoint;
+    bpmTuringHV:       result:=rsTuringHVBreakpoint;
     else
        result:='Error';
   end;

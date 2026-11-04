@@ -176,7 +176,8 @@ implementation
 uses debughelper,debuggertypedefinitions, debugeventhandler, MainUnit,frmFloatingPointPanelUnit,
      Memorybrowserformunit,disassembler,frmTracerUnit,foundcodeunit,kerneldebugger,
      advancedoptionsunit,formChangedAddresses,frmstacktraceunit,frmThreadlistunit,
-     formdebugstringsunit,formsettingsunit,processwindowunit,plugin,processhandlerunit(*,frmCreatedProcessListUnit*), mainunit2;
+     formdebugstringsunit,formsettingsunit,processwindowunit,plugin,processhandlerunit(*,frmCreatedProcessListUnit*), mainunit2
+     {$ifdef windows}, turinghvport, turinghvdebugger, turinghvui{$endif};
 
 
 resourcestring
@@ -234,6 +235,26 @@ begin
     else
     {$endif}
       mes:=rsThisWillAttachTheDebuggerOfCheatEngineToTheCurrent+' '+rsContinue;
+
+    {$ifdef windows}
+    //Turing-HV: a process opened through the hypervisor -- Windows' debugger would be the most visible thing CE could
+    //do to it. Which debugger? (Cheat Engine's own stays available: it is the user's choice, and said what it costs.)
+    if TuringHV_IsHVHandle(processhandle) and not thvDbgUseHV and (MainThreadID=GetCurrentThreadId) then
+    begin
+      case QuestionDlg('Which debugger?',
+        'This process is open through the Turing-HV hypervisor.'+sLineBreak+sLineBreak+
+        'Turing-HV debugger: breakpoints are held by the hypervisor -- no debug port, no handle, no debug register, '+
+        'nothing in the game changes. Only the thread that hits a breakpoint stops. One breakpoint per 4 KiB page, 4 in all. '+
+        '(Remembered: Settings > Debugger Options.)'+sLineBreak+sLineBreak+
+        'Cheat Engine''s debugger: the Windows debug API (or VEH / kernel, as set in Settings) -- the game can see it.',
+        mtConfirmation, [mrYes, 'Turing-HV debugger', mrNo, 'Cheat Engine''s debugger (visible)', mrCancel, 'Cancel'], 0) of
+        mrYes: TuringHV_RememberDebuggerChoice(true);
+        mrNo: ;
+        else exit(false);
+      end;
+      ask:=false;   //the question was the confirmation
+    end;
+    {$endif}
 
     if ask then
       res:=Messagedlg(mes,mtConfirmation,[mbYes, mbNo],0)=mrYes

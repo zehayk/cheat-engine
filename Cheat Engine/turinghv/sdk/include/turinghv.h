@@ -30,14 +30,17 @@
 extern "C" {
 #endif
 
-#define THV_CLIENT_API_VERSION 0x0001000Au   /* 1.1: batched transfers; 1.2: physical reads; 1.3: the caller gate;
+#define THV_CLIENT_API_VERSION 0x0001000Du   /* 1.1: batched transfers; 1.2: physical reads; 1.3: the caller gate;
                                                 1.4: the operator's trusted programs; 1.5: trusted at once, a
                                                 connection without a session, the boot recorder's hook sites;
                                                 1.6: the write watch, enriched watch hits, recording now;
                                                 1.7: the hypervisor's text log;
                                                 1.8: the data watch (thv_dwatch_*);
                                                 1.9: the instruction watch (thv_dwatch_arm_exec);
-                                                1.10: "watch harder" (thv_dwatch_arm_exec2) */
+                                                1.10: "watch harder" (thv_dwatch_arm_exec2);
+                                                1.11: the capture breakpoint (thv_dwatch_arm_capture);
+                                                1.12: the parking breakpoint (thv_dwatch_arm_break);
+                                                1.13: the native trace (thv_dwatch_arm_trace) */
 #define THV_CR3_SCAN_VALIDATORS 4u
 
 /* Hypervisor statuses retain their firmware values.  Client-side failures use
@@ -543,6 +546,139 @@ THV_API uint32_t THV_CALL thv_dwatch_arm_exec(uint64_t cr3, uint64_t address, ui
 THV_API uint32_t THV_CALL thv_dwatch_arm_exec2(uint64_t cr3, uint64_t address, uint32_t length,
                                                const thv_dwatch_operand *operand, uint32_t flags, uint32_t *id,
                                                thv_dwatch_status *status);
+
+/*
+ * 1.11 (rev148): THE CAPTURE BREAKPOINT -- "snapshot and disarm". Armed like the instruction watch (the instruction's
+ * code page composed NOT executable, single-stepped so the guest sees no debug state), but the FIRST time the watched
+ * instruction runs in the watched address space the hypervisor copies a full snapshot into a record and DISARMS the
+ * watch: every general register, RIP / RFLAGS / RSP, CR2 / CR3 / EFER / DR6 / DR7, the segment selectors and bases, the
+ * x87 / SSE state (XMM0..15), a slice of the stack from RSP, the code bytes around RIP and -- when asked -- the bytes
+ * each register and the memory operand point at, plus the thread's PID / TID. Nothing is written to the guest; reads
+ * stop at an unmapped page without faulting it. The caller sizes the snapshot (thv_capture_cfg). max_hits > 1 keeps the
+ * last THV_CAP_RECS. The call stack is NOT walked here -- unwind the returned stack slice with the modules' unwind data.
+ * A hypervisor older than rev148 answers THV_E_BAD_ARGUMENT to the kind.
+ */
+#define THV_DWATCH_CAPTURE 5u    /* kind                                                                          */
+#define THV_CAP_STACK_MAX  512u
+#define THV_CAP_CODE_MAX   256u
+#define THV_CAP_DEREF_MAX  128u
+#define THV_CAP_DEREFS     17u   /* 16 GPRs (RAX..R15) then the operand                                           */
+#define THV_CAP_RECS       4u
+#define THV_CAPF_SSE       1u    /* capture XMM0..15 + the FXSAVE header                                          */
+#define THV_CAPF_DEREF     2u    /* read bytes at every register that looks like a pointer                        */
+#define THV_CAPF_OPERAND   4u    /* also read at the operand address (needs an operand)                           */
+#define THV_CAPF_IDENT     8u    /* read PID / TID from the TEB (user-mode hits)                                  */
+typedef struct thv_capture_cfg {
+    uint32_t max_hits;           /* captures before disarm (0 -> 1); last THV_CAP_RECS kept                       */
+    uint32_t flags;              /* THV_CAPF_*                                                                    */
+    uint32_t stack_bytes;        /* 0..THV_CAP_STACK_MAX                                                          */
+    uint32_t code_before;        /* code_before + code_after <= THV_CAP_CODE_MAX                                  */
+    uint32_t code_after;
+    uint32_t deref_bytes;        /* 0..THV_CAP_DEREF_MAX per slot                                                 */
+    uint32_t rsvd[2];            /* 0                                                                             */
+} thv_capture_cfg;
+typedef struct thv_capture_seg { uint64_t base; uint32_t limit; uint16_t sel, attrib; } thv_capture_seg;
+typedef struct thv_capture_rec {
+    uint64_t seq;                /* 1.. ; 0 = this record is empty                                                */
+    uint64_t rip, rflags, rsp, cr2, cr3, efer, xcr0, dr6, dr7;
+    uint64_t gpr[16];            /* RAX RCX RDX RBX RSP RBP RSI RDI R8..R15                                        */
+    uint64_t fs_base, gs_base, kernel_gs_base;
+    thv_capture_seg cs, ss, ds, es, fs, gs;
+    uint64_t operand_addr;
+    uint64_t tsc;
+    uint64_t pid, tid;
+    uint32_t vcpu, cpl, flags;   /* flags: THV_CAPF_* actually captured                                           */
+    uint32_t stack_len, code_len, code_before;     /* code_before = RIP's byte index in code[]                    */
+    uint32_t deref_len[THV_CAP_DEREFS];
+    uint8_t  xmm[256];
+    uint8_t  fxsave_hdr[32];     /* FCW, FSW, FTW, FOP, FIP, FDP, MXCSR, MXCSR_MASK                                */
+    uint8_t  stack[THV_CAP_STACK_MAX];
+    uint8_t  code[THV_CAP_CODE_MAX];
+    uint8_t  deref[THV_CAP_DEREFS][THV_CAP_DEREF_MAX];
+} thv_capture_rec;
+/* Arm a capture breakpoint. `operand` may be NULL (only for THV_CAPF_OPERAND / rec.operand_addr); `cfg` may be NULL
+ * (one capture, registers + the default stack). *id (1..4) names the watch. */
+THV_API uint32_t THV_CALL thv_dwatch_arm_capture(uint64_t cr3, uint64_t address, uint32_t length,
+                                                 const thv_dwatch_operand *operand, const thv_capture_cfg *cfg,
+                                                 uint32_t *id, thv_dwatch_status *status);
+/* Read capture record `index` (0 = oldest kept) of watch `id` into `rec`. status->count = records held,
+ * status->entries = captures taken, status->paused = 1 once disarmed. THV_E_NOT_FOUND if `id` is not a capture watch. */
+THV_API uint32_t THV_CALL thv_dwatch_cap_read(uint32_t id, uint32_t index, thv_capture_rec *rec,
+                                              thv_dwatch_status *status);
+
+/*
+ * 1.12 (rev149): THE PARKING BREAKPOINT. Armed like the capture breakpoint; a user-mode thread that reaches the
+ * instruction is PARKED (held re-faulting at it, the core free, nothing visible to the guest). Its context is the
+ * HVDW_CAPTURE snapshot (thv_dwatch_break_read). Drive it with thv_dwatch_break_cmd: continue, step (into), step over
+ * a call, run to a cursor, set a register or RIP, or release. A thread is held only on the breakpoint's own page(s);
+ * a step or call-return that leaves the page runs free until the breakpoint is hit again. CPL 0 is never parked. A
+ * breakpoint nobody reads for 10 s is released. A hypervisor older than rev149 answers THV_E_BAD_ARGUMENT.
+ */
+#define THV_BKC_CONTINUE  1u
+#define THV_BKC_STEP      2u    /* step into */
+#define THV_BKC_STEPOVER  3u
+#define THV_BKC_RUNTO     4u    /* value = target RIP (on a watched page) */
+#define THV_BKC_SETREG    5u    /* reg 0..15 (RAX..R15) = value */
+#define THV_BKC_SETRIP    6u    /* RIP = value */
+#define THV_BKC_RELEASE   7u
+#define THV_BKS_HELD      0u    /* stopped at the breakpoint */
+#define THV_BKS_STEPPING  1u    /* a step / continue is in flight */
+#define THV_BKS_RANOUT    2u    /* ran off the watched page; will re-park when the breakpoint is next hit */
+typedef struct thv_break_cmd {
+    uint64_t tid;              /* the parked thread (thv_capture_rec.tid); 0 = the most recently parked */
+    uint32_t cmd;              /* THV_BKC_* */
+    uint32_t reg;              /* THV_BKC_SETREG: 0..15 */
+    uint64_t value;            /* SETREG / SETRIP value, or RUNTO target */
+} thv_break_cmd;
+/* `operand` may be NULL. *id (1..4) names the breakpoint. */
+THV_API uint32_t THV_CALL thv_dwatch_arm_break(uint64_t cr3, uint64_t address, uint32_t length,
+                                               const thv_dwatch_operand *operand, uint32_t *id, thv_dwatch_status *status);
+/* Read parked thread `index` (0 = most recently parked): status->count = threads parked, status->paused = THV_BKS_*
+ * of this one; `rec` = its context. THV_E_NOT_FOUND if `id` is not a breakpoint. */
+THV_API uint32_t THV_CALL thv_dwatch_break_read(uint32_t id, uint32_t index, thv_capture_rec *rec,
+                                                thv_dwatch_status *status);
+/* Command a parked thread. Takes effect the next time it faults (at once -- it is looping). */
+THV_API uint32_t THV_CALL thv_dwatch_break_cmd(uint32_t id, const thv_break_cmd *cmd, thv_dwatch_status *status);
+
+/*
+ * 1.13 (rev150): THE NATIVE TRACE ("break and trace" in the hypervisor; the thread never stops). Armed at a user-mode
+ * instruction; the first user thread of `cr3` to reach it is followed instruction by instruction -- on any page --
+ * and each instruction's registers (before it ran) recorded, up to `max_records` (0 -> 1000, at most THV_TRACE_MAX).
+ * It ends before anything a step would show or take from the thread (an interrupt for it, an exception, PUSHF / POPF /
+ * IRET / SYSCALL / INT n, ...): thv_trace_info.reason says which. THV_TRF_OVER records only the traced function's own
+ * instructions (a call's callee runs unrecorded). One trace at a time (THV_E_NO_SPACE). Read the records with
+ * thv_dwatch_trace_read; clear it with thv_dwatch_clear. A hypervisor older than rev150 answers THV_E_BAD_ARGUMENT.
+ */
+#define THV_TRACE_MAX      2048u
+#define THV_TRF_OVER       1u
+#define THV_TRS_ARMED      1u    /* waiting for a thread to reach the instruction */
+#define THV_TRS_RUNNING    2u
+#define THV_TRS_DONE       3u
+#define THV_TRE_COUNT      1u    /* the records asked for are taken */
+#define THV_TRE_NOSTEP     2u    /* the next instruction can't be stepped unseen (PUSHF / POPF / IRET / SYSCALL / INT n) */
+#define THV_TRE_EVENT      3u    /* an interrupt / event was due for the thread */
+#define THV_TRE_EXCEPTION  4u
+#define THV_TRE_GUEST_TF   5u    /* the thread single-steps itself */
+#define THV_TRE_LEFT       6u    /* address space / privilege changed */
+#define THV_TRE_L1         7u    /* Hyper-V kept the vCPU too long */
+#define THV_TRE_EMULATED   8u
+#define THV_TRE_CLEARED    9u
+#define THV_TRE_OTHER      10u
+typedef struct thv_trace_rec {
+    uint64_t rip, rsp, rflags;
+    uint64_t gpr[16];          /* RAX RCX RDX RBX RSP RBP RSI RDI R8..R15, before the instruction at rip ran */
+} thv_trace_rec;
+typedef struct thv_trace_info {
+    uint32_t state, reason, count, max, flags, pauses, vcpu, pad;
+    uint64_t steps, teb, pid, tid, cr3, start_tsc, end_tsc, tsc_hz;
+} thv_trace_info;
+/* *id (1..4) names the trace's watch. */
+THV_API uint32_t THV_CALL thv_dwatch_arm_trace(uint64_t cr3, uint64_t address, uint32_t length, uint32_t max_records,
+                                               uint32_t flags, uint32_t *id, thv_dwatch_status *status);
+/* The trace's state into `info`; records [first, first + *count) into `recs` (at most `max`). status->entries = records
+ * taken. Keeps the watch alive (read it at least every 10 s). */
+THV_API uint32_t THV_CALL thv_dwatch_trace_read(uint32_t id, uint32_t first, thv_trace_info *info, thv_trace_rec *recs,
+                                                uint32_t max, uint32_t *count, thv_dwatch_status *status);
 
 /*
  * 1.4 (rev137): THE BOOT RECORDER. Asked for once (THV_BOOTMON_ARM, 30..600 seconds), the NEXT boot looks at

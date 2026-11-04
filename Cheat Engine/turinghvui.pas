@@ -14,6 +14,7 @@ uses
   windows, Classes, SysUtils, Forms, Controls, StdCtrls, ExtCtrls, ComCtrls, Menus, Dialogs, Clipbrd;
 
 procedure InstallTuringHVUI(mainform: TForm);
+procedure TuringHV_RememberDebuggerChoice(useHV: boolean);
 procedure TuringHV_ShowStatus;
 function TuringHV_EnableFromUI(showerrors: boolean): boolean;
 procedure TuringHV_DisableFromUI;
@@ -25,8 +26,8 @@ implementation
 {$ifdef windows}
 
 uses
-  turinghvport, turinghvbridge, turinghvwatch, ceregistry, ProcessHandlerUnit, pluginexports, MainUnit,
-  MemoryBrowserFormUnit, Spin, strutils, math;
+  turinghvport, turinghvbridge, turinghvwatch, turinghvdebugger, ceregistry, ProcessHandlerUnit, pluginexports, MainUnit,
+  MemoryBrowserFormUnit, formsettingsunit, AdvancedOptionsUnit, symbolhandler, Spin, strutils, math;
 
 const
   REG_ENABLED   = 'TuringHV.EnableAtStartup';
@@ -44,6 +45,8 @@ const
   REG_CAP_SSE   = 'TuringHV.CapSSE';
   REG_CAP_IDENT = 'TuringHV.CapIdent';
   REG_CAP_MAX   = 'TuringHV.CapMaxHits';
+  REG_DBG_HV    = 'TuringHV.Debugger';           //Settings > Debugger Options: the Turing-HV debugger for HV targets
+  REG_DBG_SNAP  = 'TuringHV.DebuggerSnapshot';   //...its breakpoints snapshot instead of stopping the thread
 
 type
   TTuringHVMenu = class
@@ -56,6 +59,22 @@ type
     popupCapture: TMenuItem;        //rev148: the memory viewer's "capture a snapshot here"
     popupBreak: TMenuItem;          //rev149: the memory viewer's "set a parking breakpoint here"
     oldPopup, oldDbgPopup: TNotifyEvent;
+    {2026-11-04: every menu that offers Cheat Engine's own "find out what ..." offers the hypervisor's beside it (the
+     scan results, the hex view's Data Breakpoint submenu and the code list had only Cheat Engine's own, which needs a
+     debugger attached)}
+    flWatch, flAccess: TMenuItem;           //the scan results' popup
+    hxWatch, hxAccess: TMenuItem;           //the memory viewer's hex view > Data Breakpoint
+    clInstr: TMenuItem;                     //the code list's popup
+    oldFlPopup, oldMemPopup, oldClPopup: TNotifyEvent;
+    mbDone, clDone: boolean;
+    procedure FoundListPopup(Sender: TObject);
+    procedure FlWatchClick(Sender: TObject);
+    procedure FlAccessClick(Sender: TObject);
+    procedure MemoryPopupPopup(Sender: TObject);
+    procedure HxWatchClick(Sender: TObject);
+    procedure HxAccessClick(Sender: TObject);
+    procedure CodeListPopup(Sender: TObject);
+    procedure ClInstrClick(Sender: TObject);
     procedure EnableClick(Sender: TObject);
     procedure StatusClick(Sender: TObject);
     procedure WatchClick(Sender: TObject);
@@ -89,9 +108,102 @@ type
     procedure FormClose(Sender: TObject; var CloseAction: TCloseAction);
   end;
 
+  { Settings > Debugger Options: two check boxes under Cheat Engine's own debugger choices. Not a radio button among
+    them: Cheat Engine's own choice stays as it is (and so does what it saves -- the registry key is shared with an
+    installed Cheat Engine), the Turing-HV debugger takes over only for processes opened through the hypervisor. }
+  TThvSettingsHook = class
+  public
+    cbHV, cbSnap: TCheckBox;
+    oldShow: TNotifyEvent;
+    oldClose: TCloseEvent;
+    procedure FormShow(Sender: TObject);
+    procedure FormClose(Sender: TObject; var CloseAction: TCloseAction);
+    procedure HVClick(Sender: TObject);
+    procedure InstallTimer(Sender: TObject);
+  end;
+
 var
   menu: TTuringHVMenu;
   frmStatus: TfrmTuringHV;
+  settingsHook: TThvSettingsHook;
+
+procedure TThvSettingsHook.HVClick(Sender: TObject);
+begin
+  cbSnap.Enabled:=cbHV.Checked;
+end;
+
+procedure TThvSettingsHook.FormShow(Sender: TObject);
+begin
+  if assigned(oldShow) then oldShow(Sender);
+  cbHV.Checked:=thvDbgUseHV;
+  cbSnap.Checked:=thvDbgSnapshot;
+  cbSnap.Enabled:=cbHV.Checked;
+end;
+
+procedure TThvSettingsHook.FormClose(Sender: TObject; var CloseAction: TCloseAction);
+begin
+  if assigned(oldClose) then oldClose(Sender, CloseAction);
+  if formsettings.ModalResult=mrOK then
+  begin
+    thvDbgUseHV:=cbHV.Checked;
+    thvDbgSnapshot:=cbSnap.Checked;
+    cereg.writeBool(REG_DBG_HV, thvDbgUseHV);
+    cereg.writeBool(REG_DBG_SNAP, thvDbgSnapshot);
+  end;
+end;
+
+procedure TThvSettingsHook.InstallTimer(Sender: TObject);
+var
+  gb: TWinControl;
+  i: integer;
+  below: TControl;
+begin
+  if formsettings=nil then exit;   //not yet: the timer comes back
+  TTimer(Sender).Enabled:=false;
+  gb:=formsettings.gbDebuggerInterface;
+  //under the lowest visible choice in the group
+  below:=nil;
+  for i:=0 to gb.ControlCount-1 do
+    if gb.Controls[i].Visible and ((below=nil) or (gb.Controls[i].Top+gb.Controls[i].Height>below.Top+below.Height)) then
+      below:=gb.Controls[i];
+  cbHV:=TCheckBox.Create(formsettings);
+  cbHV.Parent:=gb;
+  cbHV.Caption:='Turing-HV hypervisor debugger for processes opened through Turing-HV (no debug port, handle or debug register)';
+  cbHV.Hint:='Breakpoints stop only the thread that hits them, held by the hypervisor; nothing in the game changes. '+
+    'One breakpoint per 4 KiB page, 4 in all; a step that leaves the breakpoint''s page runs on to the next hit.';
+  cbHV.ShowHint:=true;
+  cbHV.Anchors:=[akLeft, akTop];
+  if below<>nil then
+  begin
+    cbHV.AnchorSideLeft.Control:=below;
+    cbHV.AnchorSideTop.Control:=below;
+    cbHV.AnchorSideTop.Side:=asrBottom;
+  end;
+  cbHV.OnClick:=HVClick;
+  cbSnap:=TCheckBox.Create(formsettings);
+  cbSnap.Parent:=gb;
+  cbSnap.Caption:='...take a snapshot at a breakpoint and let the thread run on (nothing stops; no stepping)';
+  cbSnap.Anchors:=[akLeft, akTop];
+  cbSnap.AnchorSideLeft.Control:=cbHV;
+  cbSnap.AnchorSideTop.Control:=cbHV;
+  cbSnap.AnchorSideTop.Side:=asrBottom;
+  cbSnap.BorderSpacing.Left:=16;
+  cbHV.Checked:=thvDbgUseHV;
+  cbSnap.Checked:=thvDbgSnapshot;
+  cbSnap.Enabled:=thvDbgUseHV;
+  oldShow:=formsettings.OnShow;
+  formsettings.OnShow:=FormShow;
+  oldClose:=formsettings.OnClose;
+  formsettings.OnClose:=FormClose;
+end;
+
+{ the choice made from the "which debugger?" question (CEDebugger.startdebuggerifneeded): remembered }
+procedure TuringHV_RememberDebuggerChoice(useHV: boolean);
+begin
+  thvDbgUseHV:=useHV;
+  cereg.writeBool(REG_DBG_HV, useHV);
+  if (settingsHook<>nil) and (settingsHook.cbHV<>nil) then settingsHook.cbHV.Checked:=useHV;
+end;
 
 { ---- enable / disable ------------------------------------------------------------------------------ }
 
@@ -223,11 +335,94 @@ begin
   miAccess.Enabled:=miWatch.Enabled;
 end;
 
+{a process opened through the hypervisor: what every Turing-HV item in Cheat Engine's own menus needs}
+function hvTarget: boolean;
+begin
+  result:=TuringHV_Active and (TuringHV_Target(processhandler.processhandle)<>nil);
+end;
+
 procedure TTuringHVMenu.PopupMenu2Popup(Sender: TObject);
 begin
   if assigned(oldPopup) then oldPopup(Sender);
-  popupWatch.Visible:=TuringHV_Active and (mainform.addresslist.selectedRecord<>nil);
+  popupWatch.Visible:=hvTarget and (mainform.addresslist.selectedRecord<>nil);
   popupAccess.Visible:=popupWatch.Visible;
+end;
+
+{ ---- 2026-11-04: the scan results, the hex view, the code list ---- }
+
+procedure TTuringHVMenu.FoundListPopup(Sender: TObject);
+var a: ptruint; size: integer;
+begin
+  if assigned(oldFlPopup) then oldFlPopup(Sender);
+  flWatch.Visible:=hvTarget and mainform.FoundListSelection(a, size);
+  flAccess.Visible:=flWatch.Visible;
+end;
+
+procedure TTuringHVMenu.FlWatchClick(Sender: TObject);
+var a: ptruint; size: integer;
+begin
+  if mainform.FoundListSelection(a, size) then TuringHV_FindWhatWrites(a, size);
+end;
+
+procedure TTuringHVMenu.FlAccessClick(Sender: TObject);
+var a: ptruint; size: integer;
+begin
+  if mainform.FoundListSelection(a, size) then TuringHV_FindWhatAccesses(a, size);
+end;
+
+{the hex view's selection, as its own "Find out what accesses / writes this address" take it}
+function hexSelection(out a: ptruint; out size: integer): boolean;
+var a2: ptruint;
+begin
+  a:=0; a2:=0; size:=0;
+  result:=(MemoryBrowser<>nil) and MemoryBrowser.hexview.HasSelection;
+  if not result then exit;
+  MemoryBrowser.hexview.GetSelectionRange(a, a2);
+  if a2<a then begin a2:=a; end;
+  size:=1+integer(a2-a);
+end;
+
+procedure TTuringHVMenu.MemoryPopupPopup(Sender: TObject);
+var a: ptruint; size: integer;
+begin
+  if assigned(oldMemPopup) then oldMemPopup(Sender);
+  hxWatch.Visible:=hvTarget and hexSelection(a, size);
+  hxAccess.Visible:=hxWatch.Visible;
+end;
+
+procedure TTuringHVMenu.HxWatchClick(Sender: TObject);
+var a: ptruint; size: integer;
+begin
+  if hexSelection(a, size) then TuringHV_FindWhatWrites(a, size);
+end;
+
+procedure TTuringHVMenu.HxAccessClick(Sender: TObject);
+var a: ptruint; size: integer;
+begin
+  if hexSelection(a, size) then TuringHV_FindWhatAccesses(a, size);
+end;
+
+{the code list's own item is "Find out what addresses this code accesses / reads from / writes to" (its caption follows
+ the instruction); the hypervisor's instruction watch beside it, the same caption}
+procedure TTuringHVMenu.CodeListPopup(Sender: TObject);
+begin
+  if assigned(oldClPopup) then oldClPopup(Sender);
+  clInstr.Visible:=hvTarget and (AdvancedOptions.lvCodelist.ItemIndex<>-1) and
+                   (AdvancedOptions.code[AdvancedOptions.lvCodelist.ItemIndex]<>nil);
+  clInstr.Enabled:=AdvancedOptions.Findoutwhatthiscodechanges1.Enabled;
+  clInstr.Caption:=AdvancedOptions.Findoutwhatthiscodechanges1.Caption+' (Turing-HV)';
+end;
+
+procedure TTuringHVMenu.ClInstrClick(Sender: TObject);
+var i: integer;
+begin
+  i:=AdvancedOptions.lvCodelist.ItemIndex;
+  if (i=-1) or (AdvancedOptions.code[i]=nil) then exit;
+  try
+    TuringHV_FindWhatAddressesInstructionAccesses(symhandler.getAddressFromName(AdvancedOptions.code[i].symbolname));
+  except
+    on e: exception do MessageDlg(e.message, mtError, [mbOK], 0);
+  end;
 end;
 
 procedure TTuringHVMenu.InstrClick(Sender: TObject);
@@ -331,8 +526,48 @@ var
   anchor: TMenuItem;
   parent: TMenuItem;
 begin
+  if (not clDone) and (AdvancedOptions<>nil) then
+  begin
+    //the code list: beside its DBVM item (itself beside Cheat Engine's own)
+    clInstr:=TMenuItem.Create(AdvancedOptions);
+    clInstr.Caption:='Find out what addresses this code accesses (Turing-HV)';
+    clInstr.OnClick:=ClInstrClick;
+    clInstr.Visible:=false;
+    AdvancedOptions.PopupMenu2.Items.Insert(AdvancedOptions.PopupMenu2.Items.IndexOf(AdvancedOptions.miDBVMFindWhatCodeAccesses)+1, clInstr);
+    oldClPopup:=AdvancedOptions.PopupMenu2.OnPopup;
+    AdvancedOptions.PopupMenu2.OnPopup:=CodeListPopup;
+    clDone:=true;
+  end;
+  if mbDone then
+  begin
+    if clDone then TTimer(Sender).Free;
+    exit;
+  end;
   if MemoryBrowser=nil then exit;     //not yet: the timer comes back
-  TTimer(Sender).Enabled:=false;
+  mbDone:=true;
+  //the hex view's Data Breakpoint submenu: beside Cheat Engine's own "Find out what accesses / writes this address"
+  anchor:=MemoryBrowser.miFindWhatWrites;
+  hxWatch:=TMenuItem.Create(MemoryBrowser);
+  hxWatch.Caption:='Find out what writes to this address (Turing-HV write watch)';
+  hxWatch.OnClick:=HxWatchClick;
+  hxWatch.Visible:=false;
+  hxAccess:=TMenuItem.Create(MemoryBrowser);
+  hxAccess.Caption:='Find out what accesses this address (Turing-HV access watch)';
+  hxAccess.OnClick:=HxAccessClick;
+  hxAccess.Visible:=false;
+  if anchor.Parent<>nil then
+  begin
+    anchor.Parent.Insert(anchor.Parent.IndexOf(anchor)+1, hxWatch);
+    anchor.Parent.Insert(anchor.Parent.IndexOf(hxWatch)+1, hxAccess);
+  end
+  else
+  begin
+    MemoryBrowser.memorypopup.Items.Add(hxWatch);
+    MemoryBrowser.memorypopup.Items.Add(hxAccess);
+  end;
+  oldMemPopup:=MemoryBrowser.memorypopup.OnPopup;
+  MemoryBrowser.memorypopup.OnPopup:=MemoryPopupPopup;
+  //the disassembler's popup
   anchor:=MemoryBrowser.Findoutwhataddressesthisinstructionaccesses1;
   parent:=anchor.Parent;
   popupInstr:=TMenuItem.Create(MemoryBrowser);
@@ -364,7 +599,7 @@ begin
   end;
   oldDbgPopup:=MemoryBrowser.debuggerpopup.OnPopup;
   MemoryBrowser.debuggerpopup.OnPopup:=DebuggerPopupPopup;
-  TTimer(Sender).Free;
+  if clDone then TTimer(Sender).Free;  //else it comes back for the code list
 end;
 
 procedure TTuringHVMenu.StartupTimer(Sender: TObject);
@@ -408,6 +643,13 @@ begin
   thvCapIdent:=cereg.readBool(REG_CAP_IDENT, true);
   thvCapMaxHits:=dword(cereg.readInteger(REG_CAP_MAX, 1));
   if thvCapMaxHits=0 then thvCapMaxHits:=1;
+  thvDbgUseHV:=cereg.readBool(REG_DBG_HV, false);
+  thvDbgSnapshot:=cereg.readBool(REG_DBG_SNAP, false);
+  settingsHook:=TThvSettingsHook.Create;
+  t:=TTimer.Create(nil);
+  t.Interval:=300;
+  t.OnTimer:=settingsHook.InstallTimer;
+  t.Enabled:=true;
 
   with menu do
   begin
@@ -463,6 +705,16 @@ begin
     mf.PopupMenu2.Items.Insert(mf.PopupMenu2.Items.IndexOf(popupWatch)+1, popupAccess);
     oldPopup:=mf.PopupMenu2.OnPopup;
     mf.PopupMenu2.OnPopup:=PopupMenu2Popup;
+
+    //2026-11-04: the scan results' popup, beside Cheat Engine's own "Find out what accesses / writes this address"
+    flWatch:=newItem(mf, 'Find out what writes to this address (Turing-HV write watch)', FlWatchClick);
+    flWatch.Visible:=false;
+    mf.foundlistpopup.Items.Insert(mf.foundlistpopup.Items.IndexOf(mf.miFlFindWhatWrites)+1, flWatch);
+    flAccess:=newItem(mf, 'Find out what accesses this address (Turing-HV access watch)', FlAccessClick);
+    flAccess.Visible:=false;
+    mf.foundlistpopup.Items.Insert(mf.foundlistpopup.Items.IndexOf(flWatch)+1, flAccess);
+    oldFlPopup:=mf.foundlistpopup.OnPopup;
+    mf.foundlistpopup.OnPopup:=FoundListPopup;
   end;
 
   //the memory viewer's disassembler popup (rev147), once the memory viewer exists

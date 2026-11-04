@@ -58,7 +58,7 @@ implementation
 
 uses
   Forms, Dialogs, ComCtrls, StdCtrls, ExtCtrls, Controls, Graphics, Clipbrd, syncobjs, math, StrUtils,
-  turinghvport, turinghvbridge, FoundCodeUnit, ProcessHandlerUnit, disassembler, NewKernelHandler,
+  turinghvport, turinghvbridge, turinghvstack, FoundCodeUnit, ProcessHandlerUnit, disassembler, NewKernelHandler,
   LastDisassembleData, formChangedAddresses, symbolhandler, MemoryBrowserFormUnit;
 
 const
@@ -891,13 +891,18 @@ type
     done, cleared: boolean;
     waited: integer;
     memo: TMemo;
+    frames: TListBox;
     statusLbl: TLabel;
-    btnCopy: TButton;
+    btnCopy, btnSave, btnGo, btnAgain: TButton;
     timer: TTimer;
+    lastRip: qword;
     constructor CreateNew(AOwner: TComponent; Num: Integer = 0); override;
     procedure clearWatch;
     procedure poll(Sender: TObject);
     procedure copyClick(Sender: TObject);
+    procedure saveClick(Sender: TObject);
+    procedure goClick(Sender: TObject);
+    procedure againClick(Sender: TObject);
     procedure formClose(Sender: TObject; var ca: TCloseAction);
   end;
 
@@ -954,25 +959,132 @@ begin
           b(8,'TF')+' '+b(9,'IF')+' '+b(10,'DF')+' '+b(11,'OF');
 end;
 
-function formatCapture(const rec: TThvCaptureRec; is64: boolean): string;
+{ reads for the unwinder: the snapshot's own stack bytes first (as they were at the hit), live memory beyond them }
+type
+  TThvSnapReader = class
+  public
+    rec: PThvCaptureRec;
+    function Read(address: qword; buf: pointer; size: integer): integer;
+  end;
+
+function TThvSnapReader.Read(address: qword; buf: pointer; size: integer): integer;
+var br: ptruint;
+begin
+  result:=0;
+  if (rec<>nil) and (rec^.stack_len>0) and (address>=rec^.rsp) and (address+qword(size)<=rec^.rsp+rec^.stack_len) then
+  begin
+    move(rec^.stack[address-rec^.rsp], buf^, size);
+    exit(size);
+  end;
+  br:=0;
+  if ReadProcessMemory(processhandle, pointer(ptruint(address)), buf, size, br) then result:=integer(br);
+end;
+
+{ the decoded call stack of a snapshot / a held thread. held: the thread is stopped (live reads are exact) }
+function captureFrames(const rec: TThvCaptureRec; held: boolean): TThvFrames;
+var rd: TThvSnapReader; i: integer;
+begin
+  result:=nil;
+  rd:=TThvSnapReader.Create;
+  try
+    rd.rec:=@rec;
+    try
+      result:=ThvUnwind(rec.rip, rec.rsp, rec.gpr, rd.Read, 24);
+    except
+      setlength(result, 0);
+    end;
+    for i:=1 to high(result) do
+      result[i].live:=(not held) and ((rec.stack_len=0) or (result[i].rsp-8>=rec.rsp+rec.stack_len));
+  finally
+    rd.Free;
+  end;
+end;
+
+{ the instructions that ran just before RIP (on the way straight down to it): disassembled forward from the earliest
+  start, within 48 bytes, that lands exactly on RIP -- x86 re-synchronises, so that is the right reading in practice.
+  (If a jump landed on RIP instead, these are simply the bytes above it.) }
+function codeBefore(rip: qword; count: integer): string;
+var
+  d: TDisassembler;
+  start, a: ptruint;
+  s, desc: string;
+  lines: TStringList;
+  i: integer;
+begin
+  result:='';
+  d:=TDisassembler.Create;
+  lines:=TStringList.Create;
+  try
+    for start:=rip-48 to rip-1 do
+    begin
+      lines.Clear;
+      a:=start;
+      i:=0;
+      while (a<rip) and (i<64) do
+      begin
+        s:=d.disassemble(a, desc);
+        lines.Add('    '+s);
+        inc(i);
+      end;
+      if a=rip then
+      begin
+        for i:=max(0, lines.Count-count) to lines.Count-1 do result:=result+lines[i]+sLineBreak;
+        exit;
+      end;
+    end;
+  finally
+    lines.Free;
+    d.Free;
+  end;
+end;
+
+function xmmFloats(p: PByte): string;
+begin
+  result:=format('%g  %g  %g  %g   |  %g  %g',[PSingle(p)^, PSingle(p+4)^, PSingle(p+8)^, PSingle(p+12)^,
+    PDouble(p)^, PDouble(p+8)^]);
+end;
+
+function formatCapture(const rec: TThvCaptureRec; is64: boolean; const frames: TThvFrames; held: boolean): string; overload;
 var
   s, nm, dis: string;
   i, shown: integer;
   a2: ptruint;
   d: TDisassembler;
   v: qword;
+  anyLive: boolean;
 begin
   s:='';
   nm:=symName(rec.rip);
   s:=s+format('RIP = %.16x%s   CPL %d   vCPU %d',[rec.rip, ifthen(nm<>'', '  '+nm, ''), rec.cpl, rec.vcpu])+sLineBreak;
   if (rec.flags and THV_CAPF_IDENT)<>0 then
     s:=s+format('thread: PID %d (0x%x)  TID %d (0x%x)',[rec.pid, rec.pid, rec.tid, rec.tid])+sLineBreak;
-  s:=s+'RFLAGS = '+format('%.8x',[rec.rflags])+'  ['+flagsText(rec.rflags)+']'+sLineBreak+sLineBreak;
+  s:=s+'RFLAGS = '+format('%.8x',[rec.rflags and not qword($100)])+'  ['+flagsText(rec.rflags and not qword($100))+']'+
+    '   (TF hidden: it is the hypervisor''s own step, never the game''s)'+sLineBreak+sLineBreak;
+
+  //the call stack, decoded: caller after caller, each found with its module's own unwind tables
+  if length(frames)>0 then
+  begin
+    s:=s+'Call stack (decoded with the modules'' unwind tables; "call" = a CALL instruction precedes the return address):'+sLineBreak;
+    s:=s+ThvFramesText(frames);
+    anyLive:=false;
+    for i:=1 to high(frames) do anyLive:=anyLive or frames[i].live;
+    if anyLive then
+      s:=s+'  (live) = beyond the captured stack, read after the hit: the thread ran on, so it may have changed.'+sLineBreak;
+    s:=s+sLineBreak;
+  end;
+
+  //what ran right before this instruction
+  dis:=codeBefore(rec.rip, 6);
+  if dis<>'' then
+    s:=s+'Instructions before RIP (the straight-line path into it):'+sLineBreak+dis+sLineBreak;
 
   s:=s+'Registers:'+sLineBreak;
   for i:=0 to 7 do
-    s:=s+format('  %s = %.16x    %s = %.16x',
-      [REGN[i], rec.gpr[i], REGN[i+8], rec.gpr[i+8]])+sLineBreak;
+  begin
+    nm:=symName(rec.gpr[i]);
+    s:=s+format('  %s = %.16x %-28s %s = %.16x  %s',
+      [REGN[i], rec.gpr[i], ifthen(nm<>'', '('+nm+')', ''), REGN[i+8], rec.gpr[i+8], ifthen(symName(rec.gpr[i+8])<>'', '('+symName(rec.gpr[i+8])+')', '')])+sLineBreak;
+  end;
   s:=s+sLineBreak;
 
   s:=s+format('Segments: cs=%.4x ss=%.4x ds=%.4x es=%.4x fs=%.4x gs=%.4x',
@@ -990,10 +1102,10 @@ begin
     s:=s+sLineBreak;
   end;
 
-  //the call trail: each stack qword, naming any that points at known code
+  //the raw stack: each qword as it was, naming any that points at known code
   if rec.stack_len>=8 then
   begin
-    s:=s+format('Stack (from RSP = %.16x):',[rec.rsp])+sLineBreak;
+    s:=s+format('Stack, raw (%d bytes from RSP = %.16x; the decoded call stack is above):',[rec.stack_len, rec.rsp])+sLineBreak;
     i:=0;
     while (i+8)<=integer(rec.stack_len) do
     begin
@@ -1051,8 +1163,63 @@ begin
     s:=s+format('MXCSR = %.8x',[PCardinal(@rec.fxsave_hdr[24])^])+sLineBreak;
     for i:=0 to 15 do
       s:=s+format('  XMM%-2d = %s',[i, bytesHex(@rec.xmm[i*16], 16)])+sLineBreak;
+    s:=s+'  as floats (4 x single  |  2 x double):'+sLineBreak;
+    for i:=0 to 15 do
+      s:=s+format('  XMM%-2d   %s',[i, xmmFloats(@rec.xmm[i*16])])+sLineBreak;
   end;
   result:=s;
+end;
+
+function formatCapture(const rec: TThvCaptureRec; is64: boolean): string; overload;
+begin
+  result:=formatCapture(rec, is64, captureFrames(rec, false), false);
+end;
+
+{ the call stack as a list: double-click a frame to see it in the disassembler }
+procedure fillFrames(lb: TListBox; const frames: TThvFrames);
+var i: integer; nm: string;
+begin
+  lb.Items.BeginUpdate;
+  try
+    lb.Items.Clear;
+    for i:=0 to high(frames) do
+    begin
+      nm:=symName(frames[i].rip);
+      lb.Items.AddObject(format('#%-2d %.16x  %s%s',[i, frames[i].rip, nm,
+        ifthen(i=0, '', ifthen(frames[i].callsite, '', '   ? no call before it') + ifthen(frames[i].live, '   (live)', ''))]),
+        TObject(ptruint(frames[i].rip)));
+    end;
+    if (length(frames)>0) and (frames[high(frames)].stop<>'') then
+      lb.Items.AddObject('    (stopped: '+frames[high(frames)].stop+')', nil);
+  finally
+    lb.Items.EndUpdate;
+  end;
+end;
+
+type
+  TThvFrameClick = class
+    class procedure DblClick(Sender: TObject);
+  end;
+
+class procedure TThvFrameClick.DblClick(Sender: TObject);
+var lb: TListBox;
+begin
+  lb:=TListBox(Sender);
+  if (lb.ItemIndex<0) or (MemoryBrowser=nil) or (lb.Items.Objects[lb.ItemIndex]=nil) then exit;
+  MemoryBrowser.disassemblerview.SelectedAddress:=ptruint(lb.Items.Objects[lb.ItemIndex]);
+  MemoryBrowser.Show;
+end;
+
+function newFramesBox(owner: TForm): TListBox;
+begin
+  result:=TListBox.Create(owner);
+  result.Parent:=owner;
+  result.Align:=alTop;
+  result.Height:=130;
+  result.Font.Name:='Courier New'; result.Font.Size:=9;
+  result.Hint:='The call stack, decoded. Double-click a frame to see it in the memory viewer.';
+  result.ShowHint:=true;
+  result.OnDblClick:=TThvFrameClick.DblClick;
 end;
 
 constructor TThvCaptureForm.CreateNew(AOwner: TComponent; Num: Integer);
@@ -1063,9 +1230,21 @@ begin
   pnl:=TPanel.Create(self); pnl.Parent:=self; pnl.Align:=alBottom; pnl.Height:=34; pnl.BevelOuter:=bvNone;
   statusLbl:=TLabel.Create(self); statusLbl.Parent:=pnl; statusLbl.Left:=8; statusLbl.Top:=9;
   statusLbl.Caption:='Waiting for the instruction to run...';
-  btnCopy:=TButton.Create(self); btnCopy.Parent:=pnl; btnCopy.Caption:='Copy'; btnCopy.Width:=80;
-  btnCopy.Anchors:=[akRight,akTop]; btnCopy.Left:=pnl.ClientWidth-88; btnCopy.Top:=4; btnCopy.Enabled:=false;
+  btnCopy:=TButton.Create(self); btnCopy.Parent:=pnl; btnCopy.Caption:='Copy'; btnCopy.Width:=70;
+  btnCopy.Anchors:=[akRight,akTop]; btnCopy.Left:=pnl.ClientWidth-76; btnCopy.Top:=4; btnCopy.Enabled:=false;
   btnCopy.OnClick:=copyClick;
+  btnSave:=TButton.Create(self); btnSave.Parent:=pnl; btnSave.Caption:='Save...'; btnSave.Width:=70;
+  btnSave.Anchors:=[akRight,akTop]; btnSave.Left:=pnl.ClientWidth-150; btnSave.Top:=4; btnSave.Enabled:=false;
+  btnSave.OnClick:=saveClick;
+  btnGo:=TButton.Create(self); btnGo.Parent:=pnl; btnGo.Caption:='Go to RIP'; btnGo.Width:=76;
+  btnGo.Anchors:=[akRight,akTop]; btnGo.Left:=pnl.ClientWidth-230; btnGo.Top:=4; btnGo.Enabled:=false;
+  btnGo.Hint:='Show the instruction in the memory viewer'; btnGo.ShowHint:=true;
+  btnGo.OnClick:=goClick;
+  btnAgain:=TButton.Create(self); btnAgain.Parent:=pnl; btnAgain.Caption:='Capture again'; btnAgain.Width:=96;
+  btnAgain.Anchors:=[akRight,akTop]; btnAgain.Left:=pnl.ClientWidth-330; btnAgain.Top:=4; btnAgain.Enabled:=false;
+  btnAgain.Hint:='Arm the same capture breakpoint again (a new window shows the next hit)'; btnAgain.ShowHint:=true;
+  btnAgain.OnClick:=againClick;
+  frames:=newFramesBox(self);
   memo:=TMemo.Create(self); memo.Parent:=self; memo.Align:=alClient; memo.ReadOnly:=true;
   memo.ScrollBars:=ssBoth; memo.WordWrap:=false; memo.Font.Name:='Courier New'; memo.Font.Size:=9;
   memo.Lines.Text:='The capture breakpoint is armed. The snapshot appears here the first time the instruction runs.';
@@ -1088,6 +1267,7 @@ var
   r: dword;
   i: integer;
   txt: string;
+  fr: TThvFrames;
 begin
   if done then exit;
   inc(waited);
@@ -1107,18 +1287,47 @@ begin
     if TuringHV_Bridge.DWatchCapRead(id, dword(i), st, rec)<>THV_OK then continue;
     if st.count>1 then
       txt:=txt+format('===== capture %d of %d (seq %d) =====',[i+1, st.count, rec.seq])+sLineBreak;
-    txt:=txt+formatCapture(rec, is64)+sLineBreak;
+    fr:=captureFrames(rec, false);
+    if i=integer(st.count)-1 then begin fillFrames(frames, fr); lastRip:=rec.rip; end;   //the list: the newest hit
+    txt:=txt+formatCapture(rec, is64, fr, false)+sLineBreak;
   end;
   if txt='' then txt:='(the record could not be read back)';
   memo.Lines.Text:=txt;
   statusLbl.Caption:=format('Hit %d time(s); the last %d shown. The breakpoint has disarmed.',[st.entries, st.count]);
-  btnCopy.Enabled:=true;
+  btnCopy.Enabled:=true; btnSave.Enabled:=true; btnGo.Enabled:=lastRip<>0; btnAgain.Enabled:=true;
   clearWatch;
 end;
 
 procedure TThvCaptureForm.copyClick(Sender: TObject);
 begin
   Clipboard.AsText:=memo.Lines.Text;
+end;
+
+procedure TThvCaptureForm.saveClick(Sender: TObject);
+var sd: TSaveDialog;
+begin
+  sd:=TSaveDialog.Create(self);
+  try
+    sd.Filter:='Text (*.txt)|*.txt|All files|*.*';
+    sd.DefaultExt:='txt';
+    sd.FileName:=format('capture-%.16x.txt',[address]);
+    if sd.Execute then memo.Lines.SaveToFile(sd.FileName);
+  finally
+    sd.Free;
+  end;
+end;
+
+procedure TThvCaptureForm.goClick(Sender: TObject);
+begin
+  if (MemoryBrowser=nil) or (lastRip=0) then exit;
+  MemoryBrowser.disassemblerview.SelectedAddress:=ptruint(lastRip);
+  MemoryBrowser.Show;
+end;
+
+procedure TThvCaptureForm.againClick(Sender: TObject);
+var why: string;
+begin
+  if not TuringHV_StartCapture(ptruint(address), why) then MessageDlg(why, mtInformation, [mbOK], 0);
 end;
 
 procedure TThvCaptureForm.formClose(Sender: TObject; var ca: TCloseAction);
@@ -1215,10 +1424,13 @@ type
     cr3: qword;
     is64: boolean;
     curTid: qword;         //the thread being controlled (0 = the most recently parked)
-    lastSeq: qword;
+    lastSeq: qword;        //the shown hold's number (status.entries: rec.seq is 0 on a rev149 image)
     running: boolean;      //a step / continue was issued; waiting for the thread to stop again
+    runT0: qword;          //when (a step that doesn't land in 3 s: the breakpoint is re-armed)
+    address: qword;
     cleared: boolean;
     memo: TMemo;
+    frames: TListBox;
     statusLbl: TLabel;
     threads: TComboBox;
     timer: TTimer;
@@ -1226,6 +1438,7 @@ type
     procedure clearBp;
     procedure refreshThreads;
     procedure refreshContext;
+    procedure rearmBp;
     procedure poll(Sender: TObject);
     procedure issue(cmd, reg: dword; val: qword);
     procedure IntoClick(Sender: TObject);
@@ -1262,6 +1475,7 @@ begin
   bot:=TPanel.Create(self); bot.Parent:=self; bot.Align:=alBottom; bot.Height:=24; bot.BevelOuter:=bvNone;
   statusLbl:=TLabel.Create(self); statusLbl.Parent:=bot; statusLbl.Left:=8; statusLbl.Top:=5;
   statusLbl.Caption:='Waiting for a thread to reach the breakpoint...';
+  frames:=newFramesBox(self);
   memo:=TMemo.Create(self); memo.Parent:=self; memo.Align:=alClient; memo.ReadOnly:=true;
   memo.ScrollBars:=ssBoth; memo.WordWrap:=false; memo.Font.Name:='Courier New'; memo.Font.Size:=9;
   memo.Lines.Text:='The breakpoint is armed. When a thread of the target reaches it, that thread stops here and its'
@@ -1300,7 +1514,7 @@ begin
 end;
 
 procedure TThvBreakForm.refreshContext;
-var st: TThvDWatchStatus; rec: TThvCaptureRec; i, idx: integer;
+var st: TThvDWatchStatus; rec: TThvCaptureRec; i, idx: integer; fr: TThvFrames;
 begin
   idx:=0;
   for i:=0 to threads.Items.Count-1 do
@@ -1310,10 +1524,13 @@ begin
   begin
     memo.Lines.Text:='No thread is stopped at the breakpoint right now (it is armed; a thread will stop when it runs here).';
     statusLbl.Caption:='armed, nothing parked';
+    frames.Items.Clear;
     exit;
   end;
-  memo.Lines.Text:=formatCapture(rec, is64);
-  lastSeq:=rec.seq;
+  fr:=captureFrames(rec, st.paused=THV_BKS_HELD);
+  fillFrames(frames, fr);
+  memo.Lines.Text:=formatCapture(rec, is64, fr, st.paused=THV_BKS_HELD);
+  lastSeq:=st.entries;
   case st.paused of
     THV_BKS_HELD:     statusLbl.Caption:=format('TID %d stopped at %.16x', [rec.tid, rec.rip]);
     THV_BKS_STEPPING: statusLbl.Caption:=format('TID %d running...', [rec.tid]);
@@ -1334,9 +1551,17 @@ begin
   if integer(st.count)<>threads.Items.Count then refreshThreads;
   if running then
   begin
-    //wait until the controlled thread is held again (a step / continue finished)
-    if (st.count>0) and (st.paused=THV_BKS_HELD) and (rec.seq<>lastSeq) then begin running:=false; refreshContext; end
-    else if st.count=0 then begin running:=false; refreshContext; end;
+    //wait until the controlled thread is held again (a step / continue finished): a new hold number (status.entries)
+    if (st.count>0) and (st.paused=THV_BKS_HELD) and (st.entries<>lastSeq) then begin running:=false; refreshContext; end
+    else if st.count=0 then begin running:=false; refreshContext; end
+    else if GetTickCount64-runT0>3000 then
+    begin
+      //it didn't come back: it left the breakpoint's page, or rev149 lost the held thread -- arm the breakpoint again,
+      //so the thread stops there the next time it runs it
+      rearmBp;
+      running:=false;
+      statusLbl.Caption:='The step did not land in 3 s (the thread left this page, or the hypervisor lost it); the breakpoint is armed again.';
+    end;
   end
   else if (st.count>0) and (threads.Items.Count>0) then
   begin
@@ -1344,12 +1569,60 @@ begin
   end;
 end;
 
+procedure TThvBreakForm.rearmBp;
+var st: TThvDWatchStatus; op: TThvDWatchOperand; nid: dword;
+begin
+  if cleared or (id=0) then exit;
+  TuringHV_Bridge.DWatchClear(id, st);
+  zeromemory(@op, sizeof(op));
+  if TuringHV_Bridge.DWatchArmBreak(cr3, address, 1, op, nid, st)=THV_OK then
+  begin
+    id:=nid;
+    lastSeq:=0;
+  end
+  else
+  begin
+    cleared:=true;
+    timer.Enabled:=false;
+  end;
+end;
+
 procedure TThvBreakForm.issue(cmd, reg: dword; val: qword);
-var c: TThvBreakCmd; st: TThvDWatchStatus; r: dword;
+var
+  c: TThvBreakCmd; st: TThvDWatchStatus; r: dword;
+  rec: TThvCaptureRec;
+  d: TDisassembler;
+  a: ptruint;
+  desc: string;
+  b0: byte;
+  br: ptruint;
 begin
   if cleared then exit;
+  if cmd=THV_BKC_STEPOVER then
+  begin
+    //an indirect call (FF /2): run to the next instruction instead -- right on every image (rev149 measured
+    //`call [rip+x]` 4 bytes short and lost the thread); the hypervisor's own step over is kept for `call rel32`
+    if TuringHV_Bridge.DWatchBreakRead(id, 0, st, rec)=THV_OK then
+    begin
+      d:=TDisassembler.Create;
+      try
+        a:=ptruint(rec.rip);
+        d.disassemble(a, desc);
+        b0:=0;
+        ReadProcessMemory(processhandle, pointer(ptruint(rec.rip)), @b0, 1, br);
+        if (d.LastDisassembleData.iscall or d.LastDisassembleData.isrep) and (b0<>$E8) then
+        begin
+          cmd:=THV_BKC_RUNTO;
+          val:=a;
+        end;
+      finally
+        d.Free;
+      end;
+    end;
+  end;
   zeromemory(@c, sizeof(c));
   c.tid:=curTid; c.cmd:=cmd; c.reg:=reg; c.value:=val;
+  runT0:=GetTickCount64;
   r:=TuringHV_Bridge.DWatchBreakCmd(id, c, st);
   if r<>THV_OK then begin statusLbl.Caption:='command refused: '+thvStatusString(r); exit; end;
   if cmd in [THV_BKC_CONTINUE, THV_BKC_STEP, THV_BKC_STEPOVER, THV_BKC_RUNTO, THV_BKC_RELEASE] then
@@ -1436,7 +1709,7 @@ begin
   end;
   TuringHV_Log(format('breakpoint %d armed at %.16x',[id, address]));
   f:=TThvBreakForm.CreateNew(application);
-  f.id:=id; f.cr3:=t.cr3; f.is64:=processhandler.is64Bit;
+  f.id:=id; f.cr3:=t.cr3; f.is64:=processhandler.is64Bit; f.address:=address;
   f.Caption:=format('Breakpoint at %.16x (Turing-HV)',[address]);
   f.Show;
   f.timer.Enabled:=true;

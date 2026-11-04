@@ -143,6 +143,9 @@ type
     setcountwidth: boolean;
     fdebuggerinterfacewatchid: integer;
     {$ifdef windows}
+    miThvFindWhatCodeAccesses: TMenuItem;   //2026-11-04: the Turing-HV instruction watch, beside Cheat Engine's own
+    {$endif}
+    {$ifdef windows}
     dbvmwatchpollthread: TDBVMWatchPollThread;
     {$endif}
 
@@ -156,6 +159,9 @@ type
     function getSelection: string;
     procedure setdebuggerinterfacewatchid(id: integer);
     procedure ChangedAddressClose(Sender: TObject; var CloseAction: TCloseAction);
+    {$ifdef windows}
+    procedure miThvFindWhatCodeAccessesClick(Sender: TObject);
+    {$endif}
   public
     { Public declarations }
     addresswatched: ptruint;
@@ -194,7 +200,8 @@ implementation
 uses CEFuncProc, CEDebugger,debughelper, debugeventhandler, MemoryBrowserFormUnit,
      MainUnit,kerneldebugger, AdvancedOptionsUnit ,formFoundcodeListExtraUnit,
      MainUnit2, ProcessHandlerUnit, Globals, Parsers, DBK32functions, symbolhandler,
-     DebuggerInterfaceAPIWrapper, DBVMDebuggerInterface, breakpointtypedef;
+     DebuggerInterfaceAPIWrapper, DBVMDebuggerInterface, breakpointtypedef
+     {$ifdef windows}, turinghvport, turinghvwatch{$endif};
 
 
 
@@ -1668,6 +1675,16 @@ begin
     MemoryBrowser.findWhatthisCodeAccesses(TcodeRecord(foundcodelist.items[foundcodelist.itemindex].data).address);
 end;
 
+{$ifdef windows}
+//2026-11-04: the hypervisor's instruction watch for a found instruction (the item beside Cheat Engine's own, which
+//needs a debugger attached)
+procedure TFoundCodeDialog.miThvFindWhatCodeAccessesClick(Sender: TObject);
+begin
+  if foundcodelist.ItemIndex<>-1 then
+    TuringHV_FindWhatAddressesInstructionAccesses(TcodeRecord(foundcodelist.items[foundcodelist.itemindex].data).address);
+end;
+{$endif}
+
 function TFoundCodeDialog.getSelection:string;
 var
   i: integer;
@@ -1701,6 +1718,18 @@ begin
   Addtothecodelist1.enabled:=foundcodelist.selcount>0;
   MoreInfo1.Enabled:=foundcodelist.itemindex<>-1;
   miFindWhatCodeAccesses.enabled:=foundcodelist.itemindex<>-1;
+  {$ifdef windows}
+  if miThvFindWhatCodeAccesses=nil then
+  begin
+    miThvFindWhatCodeAccesses:=TMenuItem.Create(self);
+    miThvFindWhatCodeAccesses.Caption:='Find out what addresses this code accesses (Turing-HV)';
+    miThvFindWhatCodeAccesses.OnClick:=miThvFindWhatCodeAccessesClick;
+    miThvFindWhatCodeAccesses.ImageIndex:=miFindWhatCodeAccesses.ImageIndex;
+    pmOptions.Items.Insert(pmOptions.Items.IndexOf(miFindWhatCodeAccesses)+1, miThvFindWhatCodeAccesses);
+  end;
+  miThvFindWhatCodeAccesses.Visible:=TuringHV_Active and (TuringHV_Target(processhandler.processhandle)<>nil);
+  miThvFindWhatCodeAccesses.Enabled:=miFindWhatCodeAccesses.enabled;
+  {$endif}
 
   Copyselectiontoclipboard1.enabled:=foundcodelist.selcount>0;
   miSaveTofile.enabled:=Copyselectiontoclipboard1.Enabled;

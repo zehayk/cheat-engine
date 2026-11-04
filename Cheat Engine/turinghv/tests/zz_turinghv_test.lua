@@ -22,6 +22,27 @@ local function readinfo(fn)
 end
 local function sleepms(ms) local t0 = getTickCount(); while getTickCount() - t0 < ms do sleep(10); processMessages() end end
 local function hex(v) return v and string.format('%X', v) or 'nil' end
+-- 2026-11-04: the Turing-HV items of a popup menu (captions carry "(Turing-HV"), and firing its OnPopup as Cheat Engine does
+local function hvItems(items, t)
+  t = t or {}
+  for i = 0, items.Count - 1 do
+    local it = items[i]
+    if it.Caption:find('(Turing-HV', 1, true) then t[#t + 1] = it end
+    if it.Count > 0 then hvItems(it, t) end
+  end
+  return t
+end
+local function firePopup(pm)
+  local f = getMethodProperty(pm, 'OnPopup')
+  if f then return pcall(f, pm) end
+  return false
+end
+local function formWith(text1, text2)
+  for i = 0, getFormCount() - 1 do
+    local f = getForm(i)
+    if f.Caption:find(text1, 1, true) and (text2 == nil or f.Caption:find(text2, 1, true)) then return f end
+  end
+end
 
 local function testTarget(label, info, exename, is64)
   log('--- ' .. label .. ' (pid ' .. info.pid .. ')')
@@ -90,27 +111,74 @@ local function testTarget(label, info, exename, is64)
 
   local tl = createStringlist(); getThreadList(tl)
   check(label .. ': thread list', tl.Count >= 1, tl.Count .. ' thread(s)')
+  -- 2026-11-04: the thread list's OpenThread is a token (no Windows handle on the thread); a waiting thread's
+  -- registers come from its kernel trap frame, and RIP is right after a syscall in ntdll / win32u
+  local alltoken, anyok, sample = tl.Count > 0, false, 'none of ' .. tl.Count .. ' threads had a provable frame'
+  for i = 0, tl.Count - 1 do
+    local tid = tonumber(tl[i], 16)
+    local r = tid and turinghv_threadContext(tid)
+    if not (r and r.token) then alltoken = false end
+    if r and r.ok and not anyok then
+      local where = getNameFromAddress(r.rip) or ''
+      anyok = r.rsp ~= 0 and (where:lower():find('ntdll', 1, true) ~= nil or where:lower():find('win32u', 1, true) ~= nil)
+      sample = string.format('tid %X rip %X (%s) rsp %X rflags %X', tid, r.rip, where, r.rsp, r.rflags)
+    end
+  end
+  check(label .. ': OpenThread is a token, no Windows handle on the thread', alltoken, tl.Count .. ' thread(s)')
+  if is64 then check(label .. ': a waiting thread\'s registers from its kernel trap frame', anyok, sample) end
   tl.destroy()
 
   -- write watch (nested images only): find what writes the counter
   turinghv_findWhatWrites(info.counter, 4)
   sleepms(2500)
   local got, opc = 0, ''
-  for i = 0, getFormCount() - 1 do
-    local f = getForm(i)
-    if f.Caption:find('Turing-HV write watch', 1, true) then
+  local fcItem, fcHit, fcDetail = nil, false, 'no write watch window'
+  -- one window, found first: closing forms while walking the form list revisits ones being destroyed
+  do
+    local f = formWith('Turing-HV write watch')
+    if f then
       local lv = f.findComponentByName('FoundCodeList')
       if lv then got = lv.Items.Count; if got > 0 then opc = lv.Items[0].SubItems.Text end end
       f.findComponentByName('btnOK').doClick()   -- Stop
+      -- 2026-11-04: the found-code dialog's "Find out what addresses this code accesses" had only Cheat Engine's own
+      -- (a debugger attached); the hypervisor's instruction watch beside it, on the instruction found
+      if is64 and lv and got > 0 then
+        lv.ItemIndex = 0
+        local pm = f.findComponentByName('pmOptions')
+        firePopup(pm)
+        local items = hvItems(pm.Items)
+        fcItem = items[1]
+        fcDetail = #items .. ' Turing-HV item(s)'
+        if fcItem and fcItem.Visible and fcItem.Enabled then
+          fcItem.doClick()
+          sleepms(2500)
+          local w = formWith('Accessed addresses by', 'Turing-HV')
+          if w then
+            local cl = w.findComponentByName('Changedlist')
+            for j = 0, (cl and cl.Items.Count or 0) - 1 do
+              if tonumber(cl.Items[j].Caption, 16) == info.counter then fcHit = true end
+            end
+            fcDetail = w.Caption
+            w.findComponentByName('OKButton').doClick()
+            w.close()
+          else
+            fcDetail = 'clicked, no instruction watch window'
+          end
+        end
+      end
       f.close()
     end
   end
   check(label .. ': write watch finds the writer', got >= 1, got .. ' instruction(s): ' .. opc:gsub('[\r\n]', ' '))
+  if is64 then
+    check(label .. ': menus: the found-code dialog has the Turing-HV instruction watch, visible', fcItem ~= nil and fcItem.Visible, fcDetail)
+    check(label .. ': menus: ...and it names the counter the writer writes', fcHit, fcDetail)
+  end
 
   -- instruction watch (rev147): the addresses bump's increment accesses -- the counter, and nothing else
   local ia, itext, a = nil, '', info.bump
   for k = 1, 8 do
-    local _, _, opcode = splitDisassembledString(disassemble(a))
+    local _, opcode = splitDisassembledString(disassemble(a))   -- it returns extra, opcode, bytes, address (celua.txt says otherwise)
     if opcode and opcode:find('[', 1, true) and not opcode:lower():find('sp') then ia = a; itext = opcode; break end
     a = a + getInstructionSize(a)
   end
@@ -166,6 +234,72 @@ local function testTarget(label, info, exename, is64)
       check(label .. ': watching harder, the counter found', harder and hit2, cap)
     end
     turinghv_setOption('WatchHarder', was)
+  end
+
+  -- 2026-11-04: every menu with Cheat Engine's own "find out what ..." offers the hypervisor's beside it
+  if is64 then
+    local mf = getMainForm()
+    -- the scan results (the operator's case: only the address list had it)
+    local ms = getCurrentMemscan()
+    if ms == nil then mf.show(); processMessages(); sleepms(500); ms = getCurrentMemscan() end   -- made in FormShow
+    check(label .. ": menus: the main form's scan exists", ms ~= nil)
+    local fl3 = mf.findComponentByName('Foundlist3')
+    local idx = -1
+    local mfl = nil
+    if ms then
+      ms.firstScan(soExactValue, vtDword, rtRounded, '123456', '', 0, 0x7fffffffffffffff, '', fsmAligned, '4', false, false, false, false)
+      ms.waitTillDone()
+      sleepms(800)
+      mfl = ms.FoundList
+    end
+    for i = 0, (mfl and mfl.Count or 0) - 1 do if tonumber(mfl.Address[i], 16) == info.fixed then idx = i end end
+    check(label .. ': menus: the main scan lists the value', idx >= 0, (mfl and mfl.Count or 0) .. ' result(s)')
+    local pm = mf.findComponentByName('foundlistpopup')
+    local items = hvItems(pm.Items)
+    check(label .. ': menus: the scan results have the Turing-HV write and access watches', #items == 2, #items .. ' item(s)')
+    if idx >= 0 and #items == 2 then
+      fl3.ItemIndex = idx
+      processMessages()
+      firePopup(pm)
+      check(label .. ': menus: ...shown with a result selected', items[1].Visible and items[2].Visible,
+            tostring(items[1].Visible) .. '/' .. tostring(items[2].Visible))
+      items[1].doClick()
+      sleepms(1500)
+      local w = formWith('Turing-HV write watch')
+      check(label .. ': menus: the scan result\'s write watch opens on that address', w ~= nil and w.Caption:upper():find(hex(info.fixed), 1, true) ~= nil,
+            w and w.Caption or 'no window')
+      if w then w.findComponentByName('btnOK').doClick(); w.close() end
+      items[2].doClick()
+      sleepms(1500)
+      w = formWith('Turing-HV access watch')
+      check(label .. ': menus: the scan result\'s access watch opens on that address', w ~= nil and w.Caption:upper():find(hex(info.fixed), 1, true) ~= nil,
+            w and w.Caption or 'no window')
+      if w then w.findComponentByName('btnOK').doClick(); w.close() end
+      -- (not checked: "hidden with nothing selected" -- the scan results are an owner-data list that keeps its selection
+      -- through ItemIndex = -1 and Selected = nil from Lua (measured: Selected stays, ItemIndex 0); the items' condition
+      -- is the one Cheat Engine's own items beside them test, foundlist3.Selected <> nil)
+    end
+    -- the memory viewer's hex view > Data Breakpoint (a selection can't be made from Lua: present, and hidden without one)
+    local mv = getMemoryViewForm()
+    local mpm = mv.findComponentByName('memorypopup')
+    local hx = hvItems(mpm.Items)
+    check(label .. ': menus: the hex view\'s Data Breakpoint submenu has the Turing-HV write and access watches', #hx == 2 and
+          hx[1].Parent.Name == 'miDataBreakPointMenu', #hx .. ' item(s)' .. (hx[1] and (' under ' .. hx[1].Parent.Name) or ''))
+    if #hx == 2 then
+      firePopup(mpm)
+      check(label .. ': menus: ...hidden with nothing selected in the hex view', not hx[1].Visible and not hx[2].Visible)
+    end
+    -- the disassembler (rev147-149: three)
+    local dx = hvItems(mv.findComponentByName('debuggerpopup').Items)
+    check(label .. ': menus: the disassembler has the instruction watch, capture and parking breakpoint', #dx == 3, #dx .. ' item(s)')
+    -- the address list (rev146)
+    local ax = hvItems(mf.findComponentByName('PopupMenu2').Items)
+    check(label .. ': menus: the address list has the Turing-HV write and access watches', #ax == 2, #ax .. ' item(s)')
+    -- the code list
+    local ao
+    for i = 0, getFormCount() - 1 do if getForm(i).Name == 'AdvancedOptions' then ao = getForm(i) end end
+    local cx = ao and hvItems(ao.findComponentByName('PopupMenu2').Items) or {}
+    check(label .. ': menus: the code list has the Turing-HV instruction watch', #cx == 1, #cx .. ' item(s)')
   end
 end
 
