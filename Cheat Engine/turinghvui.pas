@@ -679,7 +679,8 @@ begin
     miSlow:=newItem(mf, 'Find the page-table root the slow way when EPROCESS lies (CR3 watch, RAM sweep)', OptionClick);
     miSlow.Checked:=thvOptSlowCr3;
     root.Add(miSlow);
-    miFallback:=newItem(mf, 'Allow Windows for what the hypervisor cannot do (allocate, protect, create threads)', OptionClick);
+    miFallback:=newItem(mf, 'Allow Windows for what the hypervisor cannot do (allocate, protect, create threads, pause, '+
+                            'suspend threads -- the game can see these)', OptionClick);
     miFallback.Checked:=thvOptOSFallback;
     root.Add(miFallback);
     miShared:=newItem(mf, 'Allow writes to read-only code of Windows'' own DLLs (shared by every process!)', OptionClick);

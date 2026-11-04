@@ -179,7 +179,7 @@ uses MainUnit, MemoryBrowserFormUnit,
   {$endif}
   GDBServerDebuggerInterface,
   DebuggerInterfaceAPIWrapper,
-  globals;
+  globals{$ifdef windows}, turinghvport{$endif};
 
 
 resourcestring
@@ -1085,7 +1085,18 @@ begin
           if (CurrentDebuggerInterface is TGDBServerDebuggerInterface) then
             TGDBServerDebuggerInterface(CurrentDebuggerInterface).suspendProcess
           else
+          begin
             x:=ntsuspendProcess(processhandle);
+            {$ifdef windows}
+            //2026-11-04: a process opened through Turing-HV pauses only through Windows (the Windows fallback); refused,
+            //the button must not say "paused" while the game runs on (Turing-HV > Status has the reason)
+            if (x<>0) and (not DBKLoaded) and TuringHV_IsHVHandle(processhandle) then
+            begin
+              pausebutton.down:=false;
+              exit;
+            end;
+            {$endif}
+          end;
           {$ifdef windows}
           if (x<>0) and (DBKLoaded) then DBKSuspendProcess(processid);
           {$endif}

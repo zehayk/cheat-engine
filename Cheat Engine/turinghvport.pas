@@ -144,7 +144,7 @@ implementation
 
 {$ifdef windows}
 
-uses math, strutils, plugin, DebuggerInterfaceAPIWrapper, DebuggerInterface;
+uses math, strutils, plugin, DebuggerInterfaceAPIWrapper, DebuggerInterface, CEDebugger;
 
 const
   USER_LIMIT = qword($800000000000);
@@ -226,6 +226,8 @@ var
   orig_Wow64GetThreadContext: TWow64GetThreadContext;
   orig_SuspendThread: TSuspendThread;
   orig_ResumeThread: TResumeThread;
+  orig_NtSuspendProcess: TntSuspendProcess;      //2026-11-04: pause / resume the process (the Windows fallback only)
+  orig_NtResumeProcess: TntResumeProcess;
 
   oldApiPointerChange: TNotifyEvent;
   pointersInstalled: boolean;
@@ -2157,6 +2159,40 @@ end;
 
 { ---- installing ---------------------------------------------------------------------------------------- }
 
+{2026-11-04: PAUSE / RESUME THE PROCESS -- Cheat Engine's pause button, "pause while scanning", the pause hotkey and
+ Lua pause() all call NtSuspendProcess on the process handle. The hypervisor can't suspend a process (it would have to
+ stop every thread as it runs); Windows can, with a handle the target can see and a suspend count it can read. So only
+ with the Windows fallback on (Turing-HV > Allow Windows ...), through that full handle; refused and logged otherwise.}
+const STATUS_NOT_SUPPORTED_ = DWORD($C00000BB);
+function HV_NtSuspendProcess(ProcessID: HANDLE): DWORD; stdcall;
+var t: TThvTarget; h: THandle;
+begin
+  t:=TuringHV_Target(ProcessID);
+  if t=nil then
+  begin
+    if assigned(orig_NtSuspendProcess) then exit(orig_NtSuspendProcess(ProcessID));
+    exit(STATUS_NOT_SUPPORTED_);
+  end;
+  h:=osHandleFor(t, 'Pause (NtSuspendProcess)');
+  if (h=0) or not assigned(orig_NtSuspendProcess) then exit(STATUS_NOT_SUPPORTED_);
+  TuringHV_Log(format('pid %d: paused through Windows (the Windows fallback is on: the target can see this)',[t.pid]));
+  result:=orig_NtSuspendProcess(h);
+end;
+
+function HV_NtResumeProcess(ProcessID: HANDLE): DWORD; stdcall;
+var t: TThvTarget; h: THandle;
+begin
+  t:=TuringHV_Target(ProcessID);
+  if t=nil then
+  begin
+    if assigned(orig_NtResumeProcess) then exit(orig_NtResumeProcess(ProcessID));
+    exit(STATUS_NOT_SUPPORTED_);
+  end;
+  h:=osHandleFor(t, 'Resume (NtResumeProcess)');
+  if (h=0) or not assigned(orig_NtResumeProcess) then exit(STATUS_NOT_SUPPORTED_);
+  result:=orig_NtResumeProcess(h);
+end;
+
 procedure ApplyPointers;
 begin
   {take what is there now as the original whenever it is not ours: another backend (DBK) may have changed it}
@@ -2188,6 +2224,8 @@ begin
   if @NewKernelHandler.Wow64GetThreadContext<>@HV_Wow64GetThreadContext then begin orig_Wow64GetThreadContext:=NewKernelHandler.Wow64GetThreadContext; NewKernelHandler.Wow64GetThreadContext:=@HV_Wow64GetThreadContext; end;
   if @NewKernelHandler.SuspendThread<>@HV_SuspendThread then begin orig_SuspendThread:=NewKernelHandler.SuspendThread; NewKernelHandler.SuspendThread:=@HV_SuspendThread; end;
   if @NewKernelHandler.ResumeThread<>@HV_ResumeThread then begin orig_ResumeThread:=NewKernelHandler.ResumeThread; NewKernelHandler.ResumeThread:=@HV_ResumeThread; end;
+  if @CEDebugger.ntSuspendProcess<>@HV_NtSuspendProcess then begin orig_NtSuspendProcess:=CEDebugger.ntSuspendProcess; CEDebugger.ntSuspendProcess:=@HV_NtSuspendProcess; end;
+  if @CEDebugger.ntResumeProcess<>@HV_NtResumeProcess then begin orig_NtResumeProcess:=CEDebugger.ntResumeProcess; CEDebugger.ntResumeProcess:=@HV_NtResumeProcess; end;
   pointersInstalled:=true;
 end;
 
@@ -2222,6 +2260,8 @@ begin
   NewKernelHandler.Wow64GetThreadContext:=orig_Wow64GetThreadContext;
   NewKernelHandler.SuspendThread:=orig_SuspendThread;
   NewKernelHandler.ResumeThread:=orig_ResumeThread;
+  CEDebugger.ntSuspendProcess:=orig_NtSuspendProcess;
+  CEDebugger.ntResumeProcess:=orig_NtResumeProcess;
   pointersInstalled:=false;
 end;
 

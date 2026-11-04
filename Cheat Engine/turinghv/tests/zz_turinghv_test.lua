@@ -378,7 +378,26 @@ timer.OnTimer = function(t)
     check('aa: the target saw it', txt:find('mailbox=555') ~= nil)
     turinghv_setOption('OSFallback', true)
     check('aa: alloc + write with the Windows fallback', autoAssemble('alloc(thvy,64)\nthvy:\ndd 1\n'))
+
+    -- 2026-11-04: pause / unpause -- Windows' NtSuspendProcess through the fallback's handle; refused without it
+    log('--- pause')
+    pause(); sleepms(300)
+    local p1 = readInteger(info.counter); sleepms(600); local p2 = readInteger(info.counter)
+    unpause(); sleepms(600)
+    local p3 = readInteger(info.counter)
+    check('pause: with the Windows fallback the target stops', p1 ~= nil and p1 == p2, tostring(p1) .. ' -> ' .. tostring(p2))
+    check('pause: ...and runs again after unpause', p2 ~= nil and p3 ~= nil and p3 > p2, tostring(p2) .. ' -> ' .. tostring(p3))
     turinghv_setOption('OSFallback', false)
+    pause(); sleepms(300)
+    local q1 = readInteger(info.counter); sleepms(600); local q2 = readInteger(info.counter)
+    local stillDown = false
+    for i = 0, getFormCount() - 1 do
+      local f = getForm(i)
+      if f.Name == 'AdvancedOptions' then local b = f.findComponentByName('Pausebutton'); stillDown = b and b.Down end
+    end
+    unpause()
+    check('pause: without the fallback it is refused (the target runs on)', q1 ~= nil and q2 ~= nil and q2 > q1, tostring(q1) .. ' -> ' .. tostring(q2))
+    check('pause: ...and the pause button does not claim "paused"', not stillDown, 'button down: ' .. tostring(stillDown))
 
     log('--- a target that exits')
     local victims = { {info32, true, 'handle'} }
