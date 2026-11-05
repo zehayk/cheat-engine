@@ -241,10 +241,14 @@ items go to the data watch too. Tested: `run_tests.ps1` "menus" checks -- the sc
 selected address, the found-code dialog's item names the address the writer writes, every menu has its items (the
 build before 2026-11-04 fails exactly those 5).
 
-**Pause (2026-11-04):** the pause button, "pause while scanning", the pause hotkey and Lua `pause()` freeze the
-process through Windows (`NtSuspendProcess`) when the Windows fallback is on, and are refused (the button pops back
-up) when it is off. Tested: `run_tests.ps1` -- with the fallback the target's counter stops and runs again after
-unpause; without it the target runs on and the button does not claim "paused" (the build before fails both).
+**Pause (rev151b, 2026-11-04; rev151 let the game run for moments between two hypervisor exits):** the pause button, "pause while scanning", the pause hotkey and Lua `pause()` use the
+hypervisor's **freeze**: every user thread of the game is held where it next tries to run its own code -- no handle,
+no suspend count, nothing in the game changes (the same hold as the parking breakpoint: each held thread keeps a CPU
+core busy while frozen). The thread list shows a frozen thread's registers (its snapshot); Lua `turinghv_freezeStatus()`
+reports it. Cheat Engine reads the freeze every 2 s; if it stops (it crashed), the hypervisor thaws the game after 10 s.
+On an image without the freeze (before rev151) Pause goes through Windows (`NtSuspendProcess`) when the Windows
+fallback is on, and is refused (the button pops back up) when it is off. Snapshots (capture, breakpoint) also show the
+full **YMM** registers (AVX) since rev151.
 
 **With the Windows fallback on** (only if Windows grants a full handle), these also work: `alloc`/`dealloc` in auto
 assembler, Lua `allocateMemory`, writes into read-only pages (code patching, NOPs) and into freshly allocated

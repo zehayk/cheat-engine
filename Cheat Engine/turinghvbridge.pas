@@ -141,6 +141,9 @@ const
   THVB_CMD_DWATCH_BK_CMD      = 42;
   THVB_CMD_DWATCH_ARM_TRACE   = 43; //turing-hv rev150 (SDK 1.13): the native trace (the thread never stops)
   THVB_CMD_DWATCH_TR_READ     = 44;
+  THVB_CMD_FREEZE_SET         = 45; //turing-hv rev151 (SDK 1.14): the freeze (pause a whole process, invisibly)
+  THVB_CMD_FREEZE_READ        = 46;
+  THVB_CMD_FREEZE_CLEAR       = 47;
   THVB_TRACE_INFO_OFF         = 128; //TR_READ: where TThvTraceInfo sits in the slot's data
 
   THV_DWATCH_WRITE  = 1;
@@ -163,6 +166,8 @@ const
   THV_CAPF_DEREF     = 2;
   THV_CAPF_OPERAND   = 4;
   THV_CAPF_IDENT     = 8;
+  THV_CAPF_AVX       = 16;  //rev151 (SDK 1.14), in a record's flags: ymm_hi holds YMM0..15's upper halves
+  THV_FZ_THREADS     = 32;  //rev151: held threads the freeze snapshots
   //rev149: the parking breakpoint (DWatchArmBreak / DWatchBreakRead / DWatchBreakCmd)
   THV_BKC_CONTINUE   = 1;
   THV_BKC_STEP       = 2;   //step into
@@ -453,8 +458,20 @@ type
     stack: array[0..THV_CAP_STACK_MAX-1] of byte;
     code: array[0..THV_CAP_CODE_MAX-1] of byte;
     deref: array[0..THV_CAP_DEREFS-1, 0..THV_CAP_DEREF_MAX-1] of byte;
+    ymm_hi: array[0..255] of byte;      //rev151: YMM0..15's upper halves (THV_CAPF_AVX)
   end;
   PThvCaptureRec = ^TThvCaptureRec;
+
+  { rev151: the freeze's state (thv_freeze_status) }
+  TThvFreezeStatus = record
+    supported, active: dword;
+    threads: dword;                //threads held at least once (snapshotted, up to THV_FZ_THREADS)
+    vcpus: dword;                  //cores running the frozen process's copy now
+    cr3, user_cr3: qword;
+    holds, switches, emulated, undecoded: qword;
+    since_tsc, tsc_hz: qword;
+  end;
+  PThvFreezeStatus = ^TThvFreezeStatus;
 
   { rev149: a command to a parked thread (thv_break_cmd) }
   TThvBreakCmd = record
@@ -658,6 +675,9 @@ type
     { turing-hv rev149: the parking breakpoint -- stop / step a thread at `address` }
     function DWatchArmBreak(cr3, address: qword; length: dword; const op: TThvDWatchOperand; out id: dword; out st: TThvDWatchStatus): dword;
     function DWatchBreakRead(id, index: dword; out st: TThvDWatchStatus; out rec: TThvCaptureRec): dword;
+    function FreezeSet(cr3, usercr3: qword; out st: TThvFreezeStatus): dword;              //rev151
+    function FreezeRead(index: dword; out st: TThvFreezeStatus; out rec: TThvCaptureRec): dword;
+    function FreezeClear(out st: TThvFreezeStatus): dword;
     function DWatchBreakCmd(id: dword; const c: TThvBreakCmd; out st: TThvDWatchStatus): dword;
     { turing-hv rev150: the native trace -- follow the first thread to reach `address`; it never stops.
       maxrecords 0 = THV_TRACE_DEFAULT; flags THV_TRF_OVER or 0.  One trace at a time. }
@@ -814,7 +834,8 @@ begin
   need(sizeof(TThvDWatchOperand),32,'thv_dwatch_operand');
   need(sizeof(TThvCaptureCfg),32,'thv_capture_cfg');
   need(sizeof(TThvCaptureSeg),16,'thv_capture_seg');
-  need(sizeof(TThvCaptureRec),3688,'thv_capture_rec');
+  need(sizeof(TThvCaptureRec),3944,'thv_capture_rec');      //rev151: + ymm_hi
+  need(sizeof(TThvFreezeStatus),80,'thv_freeze_status');
   need(sizeof(TThvBreakCmd),24,'thv_break_cmd');
   need(sizeof(TThvTraceRec),152,'thv_trace_rec');
   need(sizeof(TThvTraceInfo),96,'thv_trace_info');
@@ -1948,6 +1969,52 @@ begin
         if n>0 then move((slotData(i)+THVB_ARRAY_OFF)^, recs[0], n*sizeof(TThvTraceRec));
       end;
     end;
+  finally
+    Release(i);
+  end;
+end;
+
+{ rev151: the freeze }
+function TThvBridge.FreezeSet(cr3, usercr3: qword; out st: TThvFreezeStatus): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    result:=Exec(i, THVB_CMD_FREEZE_SET, [cr3, usercr3]);
+    if completed(i) then st:=PThvFreezeStatus(slotData(i))^;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.FreezeRead(index: dword; out st: TThvFreezeStatus; out rec: TThvCaptureRec): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  zeromemory(@rec,sizeof(rec));
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    result:=Exec(i, THVB_CMD_FREEZE_READ, [index]);
+    if completed(i) then
+    begin
+      st:=PThvFreezeStatus(slotData(i))^;
+      if (result=THV_OK) and (index<st.threads) and (fData>=THVB_ARRAY_OFF+sizeof(rec)) then
+        move((slotData(i)+THVB_ARRAY_OFF)^, rec, sizeof(rec));
+    end;
+  finally
+    Release(i);
+  end;
+end;
+
+function TThvBridge.FreezeClear(out st: TThvFreezeStatus): dword;
+var i: integer;
+begin
+  zeromemory(@st,sizeof(st));
+  i:=Acquire; if i<0 then exit(THVB_E_NO_BRIDGE);
+  try
+    result:=Exec(i, THVB_CMD_FREEZE_CLEAR, []);
+    if completed(i) then st:=PThvFreezeStatus(slotData(i))^;
   finally
     Release(i);
   end;

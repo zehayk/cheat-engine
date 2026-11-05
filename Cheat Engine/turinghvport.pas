@@ -131,6 +131,8 @@ procedure TuringHV_Log(const s: string);
 function TuringHV_LogText: string;
 //2026-11-04: open a thread the way Cheat Engine does, read its context, close it (the Lua test)
 function TuringHV_ThreadContext(tid: dword; out c: TContext; out token: boolean): boolean;
+//rev151: the pid Cheat Engine's pause froze through the hypervisor (0 = none)
+function TuringHV_FrozenPid: dword;
 
 type TThvParkedContext = function(tid: dword; var c: TContext): boolean;
 var
@@ -2032,6 +2034,92 @@ begin
   result:=h;
 end;
 
+{ rev151: THE FREEZE -- Cheat Engine's pause (button, "pause while scanning", hotkey, Lua pause()) holds every user
+  thread of the process in the hypervisor: nothing in the game changes, no handle, no suspend count. The hypervisor
+  thaws a freeze nobody reads for 10 s (so a crashed Cheat Engine never leaves a game frozen): the keeper reads it every
+  2 s while paused. Each held thread's snapshot answers GetThreadContext (the thread list shows its registers). }
+type
+  TThvFreezeKeeper = class(TThread)
+  protected
+    procedure Execute; override;
+  end;
+var
+  fzKeeper: TThvFreezeKeeper;
+  fzPid: dword;
+
+procedure TThvFreezeKeeper.Execute;
+var st: TThvFreezeStatus; rec: TThvCaptureRec; n: integer;
+begin
+  n:=0;
+  while not Terminated do
+  begin
+    sleep(100);
+    inc(n);
+    if n>=20 then
+    begin
+      n:=0;
+      TuringHV_Bridge.FreezeRead($FFFF, st, rec);     //no thread: just the status (keeps it alive)
+    end;
+  end;
+end;
+
+procedure freezeKeep(pid: dword);
+begin
+  fzPid:=pid;
+  if fzKeeper=nil then fzKeeper:=TThvFreezeKeeper.Create(false);
+end;
+
+procedure freezeStop;
+begin
+  if fzKeeper<>nil then
+  begin
+    fzKeeper.Terminate;
+    fzKeeper.WaitFor;
+    FreeAndNil(fzKeeper);
+  end;
+  fzPid:=0;
+end;
+
+function freezeContext(tid: dword; var c: TContext): boolean;
+var st: TThvFreezeStatus; rec: TThvCaptureRec; i: dword; fx: PByte;
+begin
+  result:=false;
+  i:=0;
+  while i<THV_FZ_THREADS do
+  begin
+    if TuringHV_Bridge.FreezeRead(i, st, rec)<>THV_OK then exit;
+    if i>=st.threads then exit;
+    if rec.tid=tid then
+    begin
+      zeromemory(@c, sizeof(c));
+      c.ContextFlags:=CONTEXT_ALL;
+      c.Rax:=rec.gpr[0]; c.Rcx:=rec.gpr[1]; c.Rdx:=rec.gpr[2]; c.Rbx:=rec.gpr[3];
+      c.Rsp:=rec.gpr[4]; c.Rbp:=rec.gpr[5]; c.Rsi:=rec.gpr[6]; c.Rdi:=rec.gpr[7];
+      c.R8:=rec.gpr[8]; c.R9:=rec.gpr[9]; c.R10:=rec.gpr[10]; c.R11:=rec.gpr[11];
+      c.R12:=rec.gpr[12]; c.R13:=rec.gpr[13]; c.R14:=rec.gpr[14]; c.R15:=rec.gpr[15];
+      c.Rip:=rec.rip;
+      c.EFlags:=dword(rec.rflags);
+      c.SegCs:=rec.cs.sel; c.SegSs:=rec.ss.sel; c.SegDs:=rec.ds.sel;
+      c.SegEs:=rec.es.sel; c.SegFs:=rec.fs.sel; c.SegGs:=rec.gs.sel;
+      if (rec.flags and THV_CAPF_SSE)<>0 then
+      begin
+        fx:=@c.FltSave;
+        move(rec.fxsave_hdr[0], fx[0], 32);
+        move(rec.xmm[0], fx[160], 256);
+        c.MxCsr:=PDWord(@rec.fxsave_hdr[24])^;
+      end;
+      exit(true);
+    end;
+    inc(i);
+  end;
+end;
+
+{ for the Lua test: the freeze's state (0 = not frozen by us) }
+function TuringHV_FrozenPid: dword;
+begin
+  result:=fzPid;
+end;
+
 function HV_GetThreadContext(hThread: THandle; var lpContext: TContext): BOOL; stdcall;
 var
   t: TThvTarget;
@@ -2039,6 +2127,7 @@ var
 begin
   if not thrTokFind(hThread, tid, t) then exit(orig_GetThreadContext(hThread, lpContext));
   if assigned(TuringHV_ParkedContext) and TuringHV_ParkedContext(tid, lpContext) then exit(true);   //held at a breakpoint
+  if (fzPid<>0) and (fzPid=t.pid) and freezeContext(tid, lpContext) then exit(true);   //rev151: held by the freeze
   result:=threadTrapContext(t, tid, lpContext);
   if not result then SetLastError(ERROR_NOT_SUPPORTED);   //running, not in a system call, or its kernel stack paged out
 end;
@@ -2165,7 +2254,7 @@ end;
  with the Windows fallback on (Turing-HV > Allow Windows ...), through that full handle; refused and logged otherwise.}
 const STATUS_NOT_SUPPORTED_ = DWORD($C00000BB);
 function HV_NtSuspendProcess(ProcessID: HANDLE): DWORD; stdcall;
-var t: TThvTarget; h: THandle;
+var t: TThvTarget; h: THandle; r: dword; fst: TThvFreezeStatus;
 begin
   t:=TuringHV_Target(ProcessID);
   if t=nil then
@@ -2173,6 +2262,16 @@ begin
     if assigned(orig_NtSuspendProcess) then exit(orig_NtSuspendProcess(ProcessID));
     exit(STATUS_NOT_SUPPORTED_);
   end;
+  //rev151: the hypervisor's freeze first -- invisible; Windows only when that is unavailable (and the fallback is on)
+  r:=TuringHV_Bridge.FreezeSet(t.cr3, 0, fst);
+  if r=THV_OK then
+  begin
+    freezeKeep(t.pid);
+    TuringHV_Log(format('pid %d: paused by the hypervisor (the freeze: every user thread held, nothing the game can see)',[t.pid]));
+    exit(0);
+  end;
+  logOnce(t, 'FreezeSet', format('Pause: the hypervisor''s freeze is not available (%.8x: a rev151 image and bridge are '+
+    'needed)',[r]));
   h:=osHandleFor(t, 'Pause (NtSuspendProcess)');
   if (h=0) or not assigned(orig_NtSuspendProcess) then exit(STATUS_NOT_SUPPORTED_);
   TuringHV_Log(format('pid %d: paused through Windows (the Windows fallback is on: the target can see this)',[t.pid]));
@@ -2180,13 +2279,20 @@ begin
 end;
 
 function HV_NtResumeProcess(ProcessID: HANDLE): DWORD; stdcall;
-var t: TThvTarget; h: THandle;
+var t: TThvTarget; h: THandle; fst: TThvFreezeStatus;
 begin
   t:=TuringHV_Target(ProcessID);
   if t=nil then
   begin
     if assigned(orig_NtResumeProcess) then exit(orig_NtResumeProcess(ProcessID));
     exit(STATUS_NOT_SUPPORTED_);
+  end;
+  if (fzPid<>0) and (fzPid=t.pid) then                          //rev151: thaw the freeze
+  begin
+    freezeStop;
+    TuringHV_Bridge.FreezeClear(fst);
+    TuringHV_Log(format('pid %d: resumed (the freeze ended)',[t.pid]));
+    exit(0);
   end;
   h:=osHandleFor(t, 'Resume (NtResumeProcess)');
   if (h=0) or not assigned(orig_NtResumeProcess) then exit(STATUS_NOT_SUPPORTED_);

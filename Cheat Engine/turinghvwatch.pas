@@ -1166,6 +1166,10 @@ begin
     s:=s+'  as floats (4 x single  |  2 x double):'+sLineBreak;
     for i:=0 to 15 do
       s:=s+format('  XMM%-2d   %s',[i, xmmFloats(@rec.xmm[i*16])])+sLineBreak;
+    //rev151: AVX -- the whole YMM register, bytes in memory order (XMM's 16, then the upper 16)
+    if (rec.flags and THV_CAPF_AVX)<>0 then
+      for i:=0 to 15 do
+        s:=s+format('  YMM%-2d = %s %s',[i, bytesHex(@rec.xmm[i*16], 16), bytesHex(@rec.ymm_hi[i*16], 16)])+sLineBreak;
   end;
   result:=s;
 end;

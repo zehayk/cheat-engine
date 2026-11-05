@@ -379,25 +379,56 @@ timer.OnTimer = function(t)
     turinghv_setOption('OSFallback', true)
     check('aa: alloc + write with the Windows fallback', autoAssemble('alloc(thvy,64)\nthvy:\ndd 1\n'))
 
-    -- 2026-11-04: pause / unpause -- Windows' NtSuspendProcess through the fallback's handle; refused without it
+    -- pause / unpause. rev151: the hypervisor's FREEZE (every user thread held, nothing the game can see) whatever the
+    -- fallback; an older image: Windows' NtSuspendProcess through the fallback's handle, refused without it (2026-11-04)
     log('--- pause')
-    pause(); sleepms(300)
-    local p1 = readInteger(info.counter); sleepms(600); local p2 = readInteger(info.counter)
-    unpause(); sleepms(600)
-    local p3 = readInteger(info.counter)
-    check('pause: with the Windows fallback the target stops', p1 ~= nil and p1 == p2, tostring(p1) .. ' -> ' .. tostring(p2))
-    check('pause: ...and runs again after unpause', p2 ~= nil and p3 ~= nil and p3 > p2, tostring(p2) .. ' -> ' .. tostring(p3))
-    turinghv_setOption('OSFallback', false)
-    pause(); sleepms(300)
-    local q1 = readInteger(info.counter); sleepms(600); local q2 = readInteger(info.counter)
-    local stillDown = false
-    for i = 0, getFormCount() - 1 do
-      local f = getForm(i)
-      if f.Name == 'AdvancedOptions' then local b = f.findComponentByName('Pausebutton'); stillDown = b and b.Down end
+    local fz = turinghv_freezeStatus()
+    if fz.supported and fz.status == 0 then
+      turinghv_setOption('OSFallback', false)
+      local c0 = readInteger(info.counter)
+      pause(); sleepms(400)
+      local f = turinghv_freezeStatus()
+      local p1 = readInteger(info.counter); sleepms(800); local p2 = readInteger(info.counter)
+      -- a frozen thread's registers through the thread list's OpenThread / GetThreadContext (its snapshot)
+      local tl = createStringlist(); getThreadList(tl)
+      local anyregs, sample = false, 'no thread snapshotted'
+      for k = 0, tl.Count - 1 do
+        local r = turinghv_threadContext(tonumber(tl[k], 16))
+        if r and r.ok and r.rip ~= 0 then anyregs = true; sample = string.format('tid %s rip %X rsp %X', tl[k], r.rip, r.rsp) end
+      end
+      tl.destroy()
+      check('pause: the freeze holds the target (its counter stops)', p1 ~= nil and p1 == p2 and f.active and f.ours == info.pid,
+            string.format('%s -> %s; active %s, threads %d, holds %d, vCPUs %d', tostring(p1), tostring(p2), tostring(f.active),
+                          f.threads, f.holds, f.vcpus))
+      check('pause: ...without the Windows fallback (no handle, nothing visible)', not turinghv_getOption('OSFallback'))
+      check('pause: ...a frozen thread has registers (its snapshot)', anyregs, sample)
+      unpause(); sleepms(600)
+      local p3 = readInteger(info.counter)
+      local f2 = turinghv_freezeStatus()
+      check('pause: ...and runs again after unpause (the freeze ended)', p3 ~= nil and p2 ~= nil and p3 > p2 and not f2.active and f2.ours == 0,
+            tostring(p2) .. ' -> ' .. tostring(p3) .. ', active ' .. tostring(f2.active))
+      log('       (counter ' .. tostring(c0) .. ' before the pause; switches ' .. f.switches .. ', MOV CR3 performed ' .. f.emulated ..
+          ', undecoded ' .. f.undecoded .. ')')
+      turinghv_setOption('OSFallback', true)
+    else
+      pause(); sleepms(300)
+      local p1 = readInteger(info.counter); sleepms(600); local p2 = readInteger(info.counter)
+      unpause(); sleepms(600)
+      local p3 = readInteger(info.counter)
+      check('pause: with the Windows fallback the target stops', p1 ~= nil and p1 == p2, tostring(p1) .. ' -> ' .. tostring(p2))
+      check('pause: ...and runs again after unpause', p2 ~= nil and p3 ~= nil and p3 > p2, tostring(p2) .. ' -> ' .. tostring(p3))
+      turinghv_setOption('OSFallback', false)
+      pause(); sleepms(300)
+      local q1 = readInteger(info.counter); sleepms(600); local q2 = readInteger(info.counter)
+      local stillDown = false
+      for i = 0, getFormCount() - 1 do
+        local f = getForm(i)
+        if f.Name == 'AdvancedOptions' then local b = f.findComponentByName('Pausebutton'); stillDown = b and b.Down end
+      end
+      unpause()
+      check('pause: without the fallback it is refused (the target runs on)', q1 ~= nil and q2 ~= nil and q2 > q1, tostring(q1) .. ' -> ' .. tostring(q2))
+      check('pause: ...and the pause button does not claim "paused"', not stillDown, 'button down: ' .. tostring(stillDown))
     end
-    unpause()
-    check('pause: without the fallback it is refused (the target runs on)', q1 ~= nil and q2 ~= nil and q2 > q1, tostring(q1) .. ' -> ' .. tostring(q2))
-    check('pause: ...and the pause button does not claim "paused"', not stillDown, 'button down: ' .. tostring(stillDown))
 
     log('--- a target that exits')
     local victims = { {info32, true, 'handle'} }

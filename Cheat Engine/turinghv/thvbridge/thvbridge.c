@@ -34,6 +34,8 @@ _Static_assert(sizeof(thv_access) == 288, "layout");
 _Static_assert(sizeof(thv_dwatch_status) == 80 && sizeof(thv_dwatch_entry) == 264, "layout (turinghvbridge.pas)");
 _Static_assert(sizeof(thv_dwatch_operand) == 32, "layout (turinghvbridge.pas TThvDWatchOperand)");
 _Static_assert(sizeof(thv_trace_rec) == 152 && sizeof(thv_trace_info) == 96, "layout (turinghvbridge.pas TThvTrace*)");
+_Static_assert(sizeof(thv_capture_rec) == 3944 && offsetof(thv_capture_rec, ymm_hi) == 3684, "layout (turinghvbridge.pas TThvCaptureRec, SDK 1.14)");
+_Static_assert(sizeof(thv_freeze_status) == 80, "layout (turinghvbridge.pas TThvFreezeStatus)");
 _Static_assert(THVB_TRACE_INFO_OFF >= sizeof(thv_dwatch_status) &&
                THVB_TRACE_INFO_OFF + sizeof(thv_trace_info) <= THVB_ARRAY_OFF, "layout (TR_READ)");
 _Static_assert(offsetof(thvb_shared, version) == 1376, "layout");
@@ -62,6 +64,15 @@ static void refresh_self_cr3(void) {
     memset(&self, 0, sizeof self);
     if (thv_get_process_info(GetCurrentProcessId(), &self) == THV_OK && self.dirbase)
         g_self_cr3 = self.dirbase & ~0xFFFull;
+}
+
+/* rev151: the process that started the broker (Cheat Engine / x64dbg): a freeze of it would stop the debugger itself */
+static volatile DWORD g_parent_pid;
+static int is_parent_cr3(uint64_t cr3) {
+    thv_process_info p;
+    memset(&p, 0, sizeof p);
+    if (!g_parent_pid || thv_get_process_info(g_parent_pid, &p) != THV_OK || !p.dirbase) return 0;
+    return (cr3 & 0x000FFFFFFFFFF000ull) == (p.dirbase & 0x000FFFFFFFFFF000ull);
 }
 
 /* May a request use this CR3?  0 is the broker; so is the broker's own root. */
@@ -484,6 +495,34 @@ static void dispatch(worker *w, const thvb_slot *q, thvb_slot *r, uint8_t *d, in
         r->out_len = sizeof(thv_dwatch_status);
         break;
     }
+    /* turing-hv rev151: the freeze */
+    case THVB_CMD_FREEZE_SET: {
+        thv_freeze_status *s = (thv_freeze_status *)d;
+        memset(s, 0, sizeof *s);
+        r->out_len = sizeof *s;
+        if (!foreign_cr3(q->arg[0]) || is_parent_cr3(q->arg[0]) ||
+            (q->arg[1] && (!foreign_cr3(q->arg[1]) || is_parent_cr3(q->arg[1])))) { r->status = THV_E_BAD_ARGUMENT; break; }
+        r->status = thv_freeze_set(q->arg[0], q->arg[1], s);
+        break;
+    }
+    case THVB_CMD_FREEZE_READ: {
+        if (THVB_ARRAY_OFF + sizeof(thv_capture_rec) > cap) { r->status = THV_E_BAD_ARGUMENT; break; }
+        thv_freeze_status *s = (thv_freeze_status *)d;
+        memset(s, 0, sizeof *s);
+        thv_capture_rec *rec = (thv_capture_rec *)(d + THVB_ARRAY_OFF);
+        memset(rec, 0, sizeof *rec);
+        r->status = thv_freeze_read((uint32_t)q->arg[0], rec, s);
+        r->ret[0] = s->threads;
+        r->out_len = THVB_ARRAY_OFF + (uint32_t)sizeof(thv_capture_rec);
+        break;
+    }
+    case THVB_CMD_FREEZE_CLEAR: {
+        thv_freeze_status *s = (thv_freeze_status *)d;
+        memset(s, 0, sizeof *s);
+        r->status = thv_freeze_clear(s);
+        r->out_len = sizeof *s;
+        break;
+    }
     /* turing-hv rev150: the native trace */
     case THVB_CMD_DWATCH_ARM_TRACE: {
         if (!foreign_cr3(q->arg[0]) || !q->arg[2] || q->arg[2] > 15u || q->arg[3] > THV_TRACE_MAX ||
@@ -665,6 +704,7 @@ static int serve(HANDLE section) {
      * two may be the same object handle. */
     const uint64_t parent = g_shared->parent_process;
     if (!valid_parent(parent)) return start_failed(8);
+    g_parent_pid = GetProcessId((HANDLE)(uintptr_t)parent);
     for (uint32_t i = 0; i < slots; i++) {
         const uint64_t rq = g_shared->req_event[i], rs = g_shared->rsp_event[i];
         if (!valid_event(rq) || !valid_event(rs)) return start_failed(7);

@@ -34,6 +34,9 @@ unit turinghvlua;
     turinghv_traceClear(id)                  ends the trace and frees its watch (read the records first)
     turinghv_threadContext(tid)              -> {token, ok, rip, rsp, rbp, rflags, rbx, rsi, rdi}: the thread opened
                                                 and read as the thread list does (a token, the kernel trap frame)
+    turinghv_freezeStatus()                  -> {status, supported, active, threads, vcpus, holds, switches, emulated,
+                                                undecoded, ours}: the hypervisor's freeze (rev151) -- Cheat Engine's
+                                                pause; ours = the pid Cheat Engine froze (0 = none)
     turinghv_bridgeStats([reset])            the bridge's requests per command, and their microseconds
     turinghv_getLog()                        -> Cheat Engine's Turing-HV log
 *)
@@ -642,6 +645,25 @@ begin
   result:=1;
 end;
 
+//rev151: turinghv_freezeStatus() -> table: the hypervisor's freeze (Cheat Engine's pause)
+function l_freezeStatus(L: Plua_State): integer; cdecl;
+var st: TThvFreezeStatus; rec: TThvCaptureRec; r: dword;
+begin
+  r:=TuringHV_Bridge.FreezeRead($FFFF, st, rec);
+  lua_newtable(L);
+  lua_pushstring(L, 'status'); lua_pushinteger(L, r); lua_settable(L, -3);
+  lua_pushstring(L, 'supported'); lua_pushboolean(L, st.supported<>0); lua_settable(L, -3);
+  lua_pushstring(L, 'active'); lua_pushboolean(L, st.active<>0); lua_settable(L, -3);
+  lua_pushstring(L, 'threads'); lua_pushinteger(L, st.threads); lua_settable(L, -3);
+  lua_pushstring(L, 'vcpus'); lua_pushinteger(L, st.vcpus); lua_settable(L, -3);
+  lua_pushstring(L, 'holds'); lua_pushinteger(L, int64(st.holds)); lua_settable(L, -3);
+  lua_pushstring(L, 'switches'); lua_pushinteger(L, int64(st.switches)); lua_settable(L, -3);
+  lua_pushstring(L, 'emulated'); lua_pushinteger(L, int64(st.emulated)); lua_settable(L, -3);
+  lua_pushstring(L, 'undecoded'); lua_pushinteger(L, int64(st.undecoded)); lua_settable(L, -3);
+  lua_pushstring(L, 'ours'); lua_pushinteger(L, TuringHV_FrozenPid); lua_settable(L, -3);
+  result:=1;
+end;
+
 function l_getOption(L: Plua_State): integer; cdecl;
 var p: PBoolean;
 begin
@@ -688,6 +710,7 @@ begin
   lua_register(L, 'turinghv_traceClear', l_traceClear);
   lua_register(L, 'turinghv_bridgeStats', l_bridgeStats);
   lua_register(L, 'turinghv_threadContext', l_threadContext);
+  lua_register(L, 'turinghv_freezeStatus', l_freezeStatus);
 end;
 
 {$endif}
